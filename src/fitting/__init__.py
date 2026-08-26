@@ -1,29 +1,70 @@
-"""Fitting package providing parallel curve fitting utilities."""
+"""Generalised, JAX/Optimistix-accelerated curve fitting.
 
-from .fitter import fit_curves, fit_double_exponential_stepwise
-from .losses import mse_loss, mse_loss_linear, poisson_loss
+Fit many curves at once, optionally sharing parameters between them.
+
+    import fitting as ft
+
+    res = ft.fit(df, model=ft.Langmuir(), x=conc, loss=ft.SSE)
+    res = ft.fit(df, model=ft.Langmuir(), x=conc, loss=ft.SSE,
+                 share={"log_ymax": ft.by_level("replicate")})
+
+With no shared parameters every curve is independent, and the fit is a chunked
+``vmap`` whose peak memory does not grow with the number of curves. Sharing a
+parameter couples the curves, so a single joint solve is used instead.
+"""
+
+from .core import FittingError
+from .fitting import fit, fit_sequencing, fit_stepwise, spikein_log_norm
+from .losses import SSE, LeastSquares, LogSSE, Loss, Poisson
 from .models import (
-    BaseModel,
-    CustomModel,
-    DoubleExponentialDecayModel,
-    DoubleExponentialIntervalModel,
-    SingleExponentialDecayModel,
-    SingleExponentialIntervalModel,
+    CurveModel,
+    DoubleExponentialInterval,
+    DoubleExponentialIntervalWithBackground,
+    Langmuir,
+    LangmuirWithOffset,
+    LogisticAffinity,
+    NoConsts,
+    SingleExponentialDecay,
+    SingleExponentialDecayWithBackground,
+    SingleExponentialInterval,
+    SingleExponentialIntervalWithBackground,
 )
-from .utils import build_normalization_array, predict_sequence
+from .results import FitResult
+from .selectors import ByLevel, by_column, by_level
+from .utils import log1mexp, logsubexp
 
 __all__ = [
-    "BaseModel",
-    "SingleExponentialIntervalModel",
-    "DoubleExponentialIntervalModel",
-    "SingleExponentialDecayModel",
-    "DoubleExponentialDecayModel",
-    "CustomModel",
-    "poisson_loss",
-    "mse_loss",
-    "mse_loss_linear",
-    "fit_curves",
-    "fit_double_exponential_stepwise",
-    "predict_sequence",
-    "build_normalization_array",
+    # entry points
+    "fit",
+    "fit_sequencing",
+    "fit_stepwise",
+    # core
+    "CurveModel",
+    "FitResult",
+    "Loss",
+    "NoConsts",
+    "FittingError",
+    # losses
+    "Poisson",
+    "SSE",
+    "LogSSE",
+    # models
+    "SingleExponentialInterval",
+    "SingleExponentialIntervalWithBackground",
+    "DoubleExponentialInterval",
+    "DoubleExponentialIntervalWithBackground",
+    "SingleExponentialDecay",
+    "SingleExponentialDecayWithBackground",
+    "Langmuir",
+    "LangmuirWithOffset",
+    "LogisticAffinity",
+    # parameter containers are nested on their models, e.g.
+    # fitting.Langmuir.Params -- see CurveModel
+    # selectors and helpers
+    "by_level",
+    "by_column",
+    "ByLevel",
+    "spikein_log_norm",
+    "log1mexp",
+    "logsubexp",
 ]

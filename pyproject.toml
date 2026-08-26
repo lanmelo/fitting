@@ -19,11 +19,17 @@ dependencies = [
     "jax>=0.4",
     "jaxlib>=0.4",
     "optimistix>=0.1",
+    # Used directly for Module/field; do not rely on it arriving via optimistix.
+    "equinox>=0.11",
     "numpy>=2.0",
     "pandas>=2.0",
 ]
 
 [project.optional-dependencies]
+docs = [
+    "sphinx",
+    "sphinx-rtd-theme",
+]
 dev = [
     "pytest",
     "tox",
@@ -37,6 +43,14 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+markers = [
+    "production: regression tests needing the real STAMMP-seq dataset",
+]
+addopts = "-m 'not production'"
+
 [tool.tox]
 env_list = ["py312", "mypy", "pylint", "black", "isort"]
 
@@ -47,6 +61,16 @@ deps = [
 ]
 commands = [
     ["pytest", { replace = "posargs", default = ["tests"], extend = true }],
+]
+
+[tool.tox.env.docs]
+description = "build the HTML documentation"
+deps = [
+    "sphinx",
+    "sphinx-rtd-theme",
+]
+commands = [
+    ["sphinx-build", "-b", "html", "docs", "docs/_build/html"],
 ]
 
 [tool.tox.env.mypy]

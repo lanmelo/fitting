@@ -1,374 +1,511 @@
-"""Pre-built and custom curve models for JAX-based fitting."""
+r"""Built-in curve models.
 
-from typing import Any, Callable, Optional, override
+Notation used throughout, matching the parameter names:
 
+.. math::
+    \eta_j = e^{\mathtt{log\_norm}_j}, \quad
+    y_0 = e^{\mathtt{log\_y0}}, \quad
+    k_{\mathrm{off}} = e^{\mathtt{log\_k\_off}}, \quad
+    b = e^{\mathtt{log\_bg}}
+
+Rates and amplitudes are fitted in log space because they span orders of
+magnitude and must stay positive; predictions for the count models are
+likewise formed in log space, so no intermediate quantity is ever
+exponentiated and re-logged."""
+
+from typing import Any, ClassVar, cast, override
+
+import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
-import pandas as pd
 
+from .core import ArrayLike, NDArray, extend_params
+
+# Every nested Params/Consts is a pure data container, so pylint's
+# minimum-public-methods rule never applies to them.
+# pylint: disable=too-few-public-methods
 from .utils import logsubexp
 
 
-class BaseModel:
-    """Abstract base class for all fitting models."""
-
-    @property
-    def param_names(self) -> list[str]:
-        """Names of parameters in the order they are optimized."""
-        raise NotImplementedError
-
-    def predict(
-        self,
-        p: jnp.ndarray,
-        log_norm: jnp.ndarray,
-        times: jnp.ndarray,
-        **kwargs: Any,
-    ) -> jnp.ndarray:
-        """Predict the model output for a single curve.
-
-        Args:
-            p: Parameters for the curve (1D jnp.ndarray).
-            log_norm: Log-scale normalization array (1D jnp.ndarray).
-            times: Timepoints array (1D jnp.ndarray).
-            **kwargs: Additional model-specific arguments.
-
-        Returns:
-            log_predictions: 1D jnp.ndarray of log-predicted values.
-        """
-        raise NotImplementedError
-
-    def initialize_params(
-        self, y_obs: np.ndarray, **kwargs: Any
-    ) -> np.ndarray:
-        """Initialize parameters for a batch of curves.
-
-        Args:
-            y_obs: Observed data matrix of shape (n_curves, n_timepoints).
-            **kwargs: Additional arguments for initialization.
-
-        Returns:
-            init_p: Stacked parameters of shape (n_curves, n_params).
-        """
-        raise NotImplementedError
-
-    def postprocess_results(
-        self, df_results: pd.DataFrame, y_data: np.ndarray
-    ) -> pd.DataFrame:
-        """Apply model-specific post-processing to the results DataFrame.
-
-        Args:
-            df_results: The fitted parameters DataFrame.
-            y_data: The raw observed data array.
-
-        Returns:
-            df_results: The modified DataFrame.
-        """
-        # Default behavior: compute total count
-        df_results["total_count"] = np.sum(y_data, axis=1)
-        return df_results
+class NoConsts(eqx.Module):
+    """Constants container for models that need no constants."""
 
 
-class SingleExponentialIntervalModel(BaseModel):
-    """Single exponential dissociation model over time intervals.
+class CurveModel(eqx.Module):
+    r"""A curve model.
 
-    Model parameters:
-        p[0]: log_y0 (initial signal)
-        p[1]: log_k_off (dissociation rate)
+    Subclasses declare:
+
+    * ``Params`` -- a nested container of every parameter of the model.
+      Whether a parameter ends up per-curve, shared across a group of curves,
+      or pinned to a constant is decided at the call site through
+      ``fit(share=...)`` and ``fit(fixed=...)``, so ``predict`` always receives
+      plain scalars and need not distinguish them.
+    * ``Consts`` -- a nested container of the model's constants, each with a
+      default, so a caller supplies only what differs.
+    * ``log_predictions`` -- whether ``predict`` returns :math:`\log \hat{y}`
+      rather than :math:`\hat{y}`. Must be matched by the objective.
+    * ``predict`` and ``init``.
+
+    Configuration that changes the *shape* of the computation (for example
+    ``concat_bound``) belongs in an ``eqx.field(static=True)`` field, so a
+    plain Python ``if`` may be used on it inside ``predict``.
     """
 
-    def __init__(self, concat_bound: bool = True):
-        self.concat_bound = concat_bound
+    Params: ClassVar[type[Any]]
+    Consts: ClassVar[type[Any]] = NoConsts
+    log_predictions: ClassVar[bool] = True
 
-    @property
-    @override
-    def param_names(self) -> list[str]:
-        return ["log_y0", "log_k_off", "log_bg"]
+    def predict(self, p: Any, x: jnp.ndarray, c: Any) -> jnp.ndarray:
+        """Predict a single curve.
 
-    @override
-    def predict(
-        self,
-        p: jnp.ndarray,
-        log_norm: jnp.ndarray,
-        times: jnp.ndarray,
-        **kwargs: Any,
-    ) -> jnp.ndarray:
-        # Prepend 0.0 to times
-        times_arr = jnp.insert(times, 0, 0.0)
-        log_bound = jnp.logaddexp(p[0] - times_arr * jnp.exp(p[1]), p[2])
+        Called under ``vmap``, once per curve.
 
-        if self.concat_bound:
-            log_counts = logsubexp(log_bound[:-2], log_bound[1:-1])
-            log_counts = jnp.concatenate([log_counts, log_bound[-1:]], axis=-1)
-        else:
-            log_counts = logsubexp(log_bound[:-1], log_bound[1:])
+        Args:
+            p: ``Params``, every field a scalar.
+            x: the independent variable for this curve, shape ``(n_points,)``.
+            c: ``Consts``. Shared constants keep the shape they were given;
+                per-curve constants have had their leading axis removed.
 
-        return log_norm + log_counts
+        Returns:
+            Predictions of shape ``(n_points,)``, ``log`` if
+            :attr:`log_predictions`.
+        """
+        raise NotImplementedError
 
-    @override
-    def initialize_params(
-        self, y_obs: np.ndarray, **kwargs: Any
-    ) -> np.ndarray:
-        s = np.sum(y_obs, axis=1)
-        log_y0_arr = np.log(np.maximum(1.0, s))
-        log_koff_arr = np.full(len(y_obs), -3.0)
-        log_bg_arr = log_y0_arr - 4.0
-        return np.stack([log_y0_arr, log_koff_arr, log_bg_arr], axis=1)
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        """Choose starting values for a batch of curves.
 
-    @override
-    def postprocess_results(
-        self, df_results: pd.DataFrame, y_data: np.ndarray
-    ) -> pd.DataFrame:
-        n_curves = len(y_data)
-        df_results["total_count"] = np.sum(y_data, axis=1)
-        if self.concat_bound:
-            df_results["kinetic_count"] = np.sum(y_data[:, :-1], axis=1)
-            df_results["bound_count"] = y_data[:, -1]
-        else:
-            df_results["kinetic_count"] = df_results["total_count"]
-            df_results["bound_count"] = np.zeros(n_curves)
-        return df_results
+        Unlike :meth:`predict` this is not vectorised, so it sees every curve
+        at once and may derive a per-curve guess from the data.
+
+        Args:
+            y: observations, shape ``(n_curves, n_points)``.
+            x: the independent variable, shared or per-curve.
+            c: ``Consts``, with per-curve constants at full width.
+
+        Returns:
+            ``Params`` with every field of shape ``(n_curves,)``.
+        """
+        raise NotImplementedError
+
+    def extra_columns(self, y: NDArray) -> dict[str, NDArray]:
+        """Summarise the observations for the results table.
+
+        Args:
+            y: observations, shape ``(n_curves, n_points)``.
+
+        Returns:
+            Column name to per-curve value, added to
+            :attr:`~fitting.results.FitResult.diagnostics`.
+        """
+        return {"total_count": np.sum(y, axis=1)}
 
 
-class DoubleExponentialIntervalModel(BaseModel):
-    """Double exponential dissociation model over time intervals.
+# --------------------------------------------------------------------------
+# Interval (sequencing) dissociation models
+# --------------------------------------------------------------------------
+class SingleExponentialInterval(CurveModel):
+    r"""Single-exponential dissociation observed as counts per time interval.
 
-    Model parameters:
-        p[0]: log_y0_1 (initial signal for first component)
-        p[1]: log_k_off_1 (dissociation rate for first component)
-        p[2]: log_y0_2 (initial signal for second component)
-        p[3]: log_k_off_2 (dissociation rate for second component)
+    A single population dissociates with rate :math:`k_{\mathrm{off}}`, so the
+    bound amount at time :math:`t` is
+
+    .. math::
+        B(t) = y_0 \, e^{-k_{\mathrm{off}} t}.
+
+    ``x`` holds the right-hand edges :math:`x_1 < \dots < x_N` of the
+    sampling intervals, and an implicit :math:`x_0 = 0` edge is prepended. Each
+    observation is the amount released during one interval, scaled by that
+    library's spike-in normalisation:
+
+    .. math::
+        \hat{y}_j = \eta_j \left[ B(x_{j-1}) - B(x_j) \right],
+        \qquad j = 1, \dots, N.
+
+    With ``concat_bound=True`` the last element of ``x`` repeats the final
+    timepoint, and the last prediction is instead the **absolute remaining
+    bound population** -- the library sequenced after repeated dissociation
+    steps:
+
+    .. math::
+        \hat{y}_j = \begin{cases}
+            \eta_j \left[ B(x_{j-1}) - B(x_j) \right]
+                & j = 1, \dots, N-1 \\
+            \eta_N \, B(x_N) & j = N
+        \end{cases}
+
+    That final term carries a large share of the information at low counts.
+    Differences are evaluated with :func:`~fitting.utils.logsubexp`, keeping
+    the whole computation in log space.
     """
 
-    def __init__(self, concat_bound: bool = True):
-        self.concat_bound = concat_bound
+    class Params(eqx.Module):
+        r"""Amplitude :math:`\log y_0`, off-rate
+        :math:`\log k_{\mathrm{off}}`."""
 
-    @property
-    @override
-    def param_names(self) -> list[str]:
-        return ["log_y0_1", "log_k_off_1", "log_y0_2", "log_k_off_2", "log_bg"]
+        log_y0: ArrayLike
+        log_k_off: ArrayLike
 
-    @override
-    def predict(
-        self,
-        p: jnp.ndarray,
-        log_norm: jnp.ndarray,
-        times: jnp.ndarray,
-        **kwargs: Any,
-    ) -> jnp.ndarray:
-        times_arr = jnp.insert(times, 0, 0.0)
-        log_bound_1 = p[0] - times_arr * jnp.exp(p[1])
-        log_bound_2 = p[2] - times_arr * jnp.exp(p[3])
-        log_bound = jnp.logaddexp(
-            jnp.logaddexp(log_bound_1, log_bound_2), p[4]
-        )
+    class Consts(eqx.Module):
+        r"""Sequencing-depth normalisation :math:`\log \eta`, in log space.
 
+        The default of ``0.0`` means "no normalisation" and broadcasts against
+        any number of timepoints, so a model can be used with or without
+        spike-ins without changing its signature.
+        """
+
+        log_norm: ArrayLike = 0.0
+
+    log_predictions: ClassVar[bool] = True
+
+    concat_bound: bool = eqx.field(static=True, default=True)
+
+    def _log_bound(self, p: Any, t: jnp.ndarray) -> jnp.ndarray:
+        r"""Return :math:`\log B(t)` at every interval edge in ``t``.
+
+        Overridden by the subclasses to change :math:`B`, which is the only
+        thing that distinguishes the models in this family.
+        """
+        return cast(jnp.ndarray, p.log_y0 - t * jnp.exp(p.log_k_off))
+
+    def _to_counts(self, log_bound: jnp.ndarray) -> jnp.ndarray:
+        r"""Turn :math:`\log B` at the edges into per-interval log counts.
+
+        Computes :math:`\log\left[ B(x_{j-1}) - B(x_j) \right]`, appending
+        :math:`\log B(x_N)` when ``concat_bound`` is set. Defined once and
+        inherited, so the background variants cannot drift from the plain
+        models in how they treat the final library.
+        """
         if self.concat_bound:
             log_counts = logsubexp(log_bound[:-2], log_bound[1:-1])
-            log_counts = jnp.concatenate([log_counts, log_bound[-1:]], axis=-1)
-        else:
-            log_counts = logsubexp(log_bound[:-1], log_bound[1:])
-
-        return log_norm + log_counts
+            return jnp.concatenate([log_counts, log_bound[-1:]], axis=-1)
+        return logsubexp(log_bound[:-1], log_bound[1:])
 
     @override
-    def initialize_params(
-        self, y_obs: np.ndarray, **kwargs: Any
-    ) -> np.ndarray:
-        n_curves = len(y_obs)
-        if "single_exp_fit" in kwargs:
-            single_fit = kwargs["single_exp_fit"]
-            if isinstance(single_fit, pd.DataFrame):
-                log_y0 = single_fit["log_y0"].to_numpy()
-                log_koff = single_fit["log_k_off"].to_numpy()
-                log_bg = (
-                    single_fit["log_bg"].to_numpy()
-                    if "log_bg" in single_fit.columns
-                    else (log_y0 - 4.0)
-                )
-            else:
-                log_y0 = single_fit[:, 0]
-                log_koff = single_fit[:, 1]
-                log_bg = (
-                    single_fit[:, 2]
-                    if single_fit.shape[1] > 2
-                    else (log_y0 - 4.0)
-                )
-        else:
-            s = np.sum(y_obs, axis=1)
-            log_y0 = np.log(np.maximum(1.0, s))
-            log_koff = np.full(n_curves, -3.0)
-            log_bg = log_y0 - 4.0
-
-        # Seed double exponential from single exponential fit
-        log_y0_1 = log_y0
-        log_koff_1 = log_koff
-        log_y0_2 = log_y0 - 2.0
-        log_koff_2 = np.full(n_curves, 0.0)
-
-        return np.stack(
-            [log_y0_1, log_koff_1, log_y0_2, log_koff_2, log_bg], axis=1
+    def predict(self, p: Any, x: jnp.ndarray, c: Any) -> jnp.ndarray:
+        t = jnp.insert(x, 0, 0.0)
+        return cast(
+            jnp.ndarray, c.log_norm + self._to_counts(self._log_bound(p, t))
         )
 
     @override
-    def postprocess_results(
-        self, df_results: pd.DataFrame, y_data: np.ndarray
-    ) -> pd.DataFrame:
-        n_curves = len(y_data)
-        df_results["total_count"] = np.sum(y_data, axis=1)
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        log_y0 = jnp.log(jnp.maximum(1.0, jnp.sum(y, axis=1)))
+        return SingleExponentialInterval.Params(
+            log_y0=log_y0, log_k_off=jnp.full(y.shape[0], -3.0)
+        )
+
+    @override
+    def extra_columns(self, y: NDArray) -> dict[str, NDArray]:
+        total = np.sum(y, axis=1)
         if self.concat_bound:
-            df_results["kinetic_count"] = np.sum(y_data[:, :-1], axis=1)
-            df_results["bound_count"] = y_data[:, -1]
-        else:
-            df_results["kinetic_count"] = df_results["total_count"]
-            df_results["bound_count"] = np.zeros(n_curves)
-        return df_results
+            return {
+                "total_count": total,
+                "kinetic_count": np.sum(y[:, :-1], axis=1),
+                "bound_count": y[:, -1],
+            }
+        return {
+            "total_count": total,
+            "kinetic_count": total,
+            "bound_count": np.zeros(len(y)),
+        }
 
 
-class SingleExponentialDecayModel(BaseModel):
-    """Standard single exponential decay model y = norm * y0 * exp(-k * t).
+class SingleExponentialIntervalWithBackground(SingleExponentialInterval):
+    r""":class:`SingleExponentialInterval` plus a constant background floor.
 
-    Model parameters:
-        p[0]: log_y0 (initial signal)
-        p[1]: log_k (decay rate)
+    .. math::
+        B(t) = y_0 \, e^{-k_{\mathrm{off}} t} + b
+
+    **Opt in deliberately.** A constant floor cancels out of every interval
+    difference, so :math:`b` is informed only by the trailing bound
+    observation -- and not at all when ``concat_bound=False``, where it has no
+    effect on the predictions whatever. On low-count data it is often not
+    identifiable; check its standard error before trusting it. See the
+    Sequencing counts guide.
     """
 
-    @property
-    @override
-    def param_names(self) -> list[str]:
-        return ["log_y0", "log_k", "log_bg"]
+    class Params(SingleExponentialInterval.Params):
+        r""":class:`SingleExponentialInterval.Params` plus a floor
+        :math:`\log b`."""
+
+        log_bg: ArrayLike
 
     @override
-    def predict(
-        self,
-        p: jnp.ndarray,
-        log_norm: jnp.ndarray,
-        times: jnp.ndarray,
-        **kwargs: Any,
-    ) -> jnp.ndarray:
-        log_signal = p[0] - times * jnp.exp(p[1])
-        return log_norm + jnp.logaddexp(log_signal, p[2])
+    def _log_bound(self, p: Any, t: jnp.ndarray) -> jnp.ndarray:
+        return jnp.logaddexp(super()._log_bound(p, t), p.log_bg)
 
     @override
-    def initialize_params(
-        self, y_obs: np.ndarray, **kwargs: Any
-    ) -> np.ndarray:
-        # Initial guess from the first timepoint
-        s = y_obs[:, 0]
-        log_y0_arr = np.log(np.maximum(1.0, s))
-        log_k_arr = np.full(len(y_obs), -3.0)
-        log_bg_arr = log_y0_arr - 4.0
-        return np.stack([log_y0_arr, log_k_arr, log_bg_arr], axis=1)
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        base = super().init(y, x, c)
+        return extend_params(self.Params, base, log_bg=base.log_y0 - 4.0)
 
 
-class DoubleExponentialDecayModel(BaseModel):
-    """Standard double exponential decay model y = norm * (components).
+class DoubleExponentialInterval(SingleExponentialInterval):
+    r"""Two independent dissociating populations, observed as interval counts.
 
-    Model parameters:
-        p[0]: log_y0_1 (initial signal for first component)
-        p[1]: log_k1 (decay rate for first component)
-        p[2]: log_y0_2 (initial signal for second component)
-        p[3]: log_k2 (decay rate for second component)
+    .. math::
+        B(t) = y_{0,1} \, e^{-k_{\mathrm{off},1} t}
+             + y_{0,2} \, e^{-k_{\mathrm{off},2} t}
+
+    The interval differencing and the optional trailing bound term are
+    inherited unchanged from :class:`SingleExponentialInterval`, so the two
+    models can be compared on the same observations. The components are
+    exchangeable, so the two :math:`(y_0, k_{\mathrm{off}})` pairs are only
+    identified up to swapping them.
     """
 
-    @property
-    @override
-    def param_names(self) -> list[str]:
-        return ["log_y0_1", "log_k1", "log_y0_2", "log_k2", "log_bg"]
+    class Params(eqx.Module):
+        r"""Two populations, each with :math:`\log y_0` and
+        :math:`\log k_{\mathrm{off}}`."""
+
+        log_y0_1: ArrayLike
+        log_k_off_1: ArrayLike
+        log_y0_2: ArrayLike
+        log_k_off_2: ArrayLike
 
     @override
-    def predict(
-        self,
-        p: jnp.ndarray,
-        log_norm: jnp.ndarray,
-        times: jnp.ndarray,
-        **kwargs: Any,
-    ) -> jnp.ndarray:
-        log_bound_1 = p[0] - times * jnp.exp(p[1])
-        log_bound_2 = p[2] - times * jnp.exp(p[3])
-        log_bound = jnp.logaddexp(log_bound_1, log_bound_2)
-        return log_norm + jnp.logaddexp(log_bound, p[4])
+    def _log_bound(self, p: Any, t: jnp.ndarray) -> jnp.ndarray:
+        return jnp.logaddexp(
+            p.log_y0_1 - t * jnp.exp(p.log_k_off_1),
+            p.log_y0_2 - t * jnp.exp(p.log_k_off_2),
+        )
 
     @override
-    def initialize_params(
-        self, y_obs: np.ndarray, **kwargs: Any
-    ) -> np.ndarray:
-        n_curves = len(y_obs)
-        if "single_exp_fit" in kwargs:
-            single_fit = kwargs["single_exp_fit"]
-            if isinstance(single_fit, pd.DataFrame):
-                log_y0 = single_fit["log_y0"].to_numpy()
-                log_k = single_fit["log_k"].to_numpy()
-                log_bg = (
-                    single_fit["log_bg"].to_numpy()
-                    if "log_bg" in single_fit.columns
-                    else (log_y0 - 4.0)
-                )
-            else:
-                log_y0 = single_fit[:, 0]
-                log_k = single_fit[:, 1]
-                log_bg = (
-                    single_fit[:, 2]
-                    if single_fit.shape[1] > 2
-                    else (log_y0 - 4.0)
-                )
-        else:
-            s = y_obs[:, 0]
-            log_y0 = np.log(np.maximum(1.0, s))
-            log_k = np.full(n_curves, -3.0)
-            log_bg = log_y0 - 4.0
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        log_y0 = jnp.log(jnp.maximum(1.0, jnp.sum(y, axis=1)))
+        n = y.shape[0]
+        return DoubleExponentialInterval.Params(
+            log_y0_1=log_y0,
+            log_k_off_1=jnp.full(n, -3.0),
+            log_y0_2=log_y0 - 2.0,
+            log_k_off_2=jnp.zeros(n),
+        )
 
-        log_y0_1 = log_y0
-        log_k1 = log_k
-        log_y0_2 = log_y0 - 2.0
-        log_k2 = np.full(n_curves, 0.0)
-
-        return np.stack([log_y0_1, log_k1, log_y0_2, log_k2, log_bg], axis=1)
+    @classmethod
+    def seed_from(cls, single: Any) -> Any:
+        """Seed a double-exponential fit from a converged single fit."""
+        return DoubleExponentialInterval.Params(
+            log_y0_1=single.log_y0,
+            log_k_off_1=single.log_k_off,
+            log_y0_2=single.log_y0 - 2.0,
+            log_k_off_2=jnp.zeros_like(single.log_y0),
+        )
 
 
-class CustomModel(BaseModel):
-    """Wrapper class for user-defined fitting models."""
+class DoubleExponentialIntervalWithBackground(DoubleExponentialInterval):
+    r""":class:`DoubleExponentialInterval` plus a constant background floor.
 
-    def __init__(
-        self,
-        predict_fn: Callable[..., jnp.ndarray],
-        param_names: list[str],
-        init_fn: Optional[Callable[..., np.ndarray]] = None,
-    ):
-        """Args:
+    .. math::
+        B(t) = y_{0,1} \, e^{-k_{\mathrm{off},1} t}
+             + y_{0,2} \, e^{-k_{\mathrm{off},2} t} + b
 
-        predict_fn: A function with signature predict_fn(p, log_norm, times)
-          returning log predictions.
-        param_names: List of parameter names in order of optimization.
-        init_fn: Optional function with signature init_fn(y_obs) returning
-          initial parameters.
-        """
-        self._predict_fn = predict_fn
-        self._param_names = param_names
-        self._init_fn = init_fn
+    The identifiability warning on
+    :class:`SingleExponentialIntervalWithBackground` applies here too: the
+    floor cancels from every interval difference, so it is informed only by
+    the trailing bound observation, and not at all when
+    ``concat_bound=False``.
+    """
 
-    @property
-    @override
-    def param_names(self) -> list[str]:
-        return self._param_names
+    class Params(DoubleExponentialInterval.Params):
+        r""":class:`DoubleExponentialInterval.Params` plus a floor
+        :math:`\log b`."""
+
+        log_bg: ArrayLike
 
     @override
-    def predict(
-        self,
-        p: jnp.ndarray,
-        log_norm: jnp.ndarray,
-        times: jnp.ndarray,
-        **kwargs: Any,
-    ) -> jnp.ndarray:
-        return self._predict_fn(p, log_norm, times, **kwargs)
+    def _log_bound(self, p: Any, t: jnp.ndarray) -> jnp.ndarray:
+        return jnp.logaddexp(super()._log_bound(p, t), p.log_bg)
 
     @override
-    def initialize_params(
-        self, y_obs: np.ndarray, **kwargs: Any
-    ) -> np.ndarray:
-        if self._init_fn is not None:
-            return self._init_fn(y_obs, **kwargs)
-        raise NotImplementedError(
-            "An initialization function was not provided for this custom "
-            "model. Please provide initial parameters directly to "
-            "fit_curves via `init_params`."
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        b = super().init(y, x, c)
+        return extend_params(self.Params, b, log_bg=b.log_y0_1 - 4.0)
+
+    @classmethod
+    @override
+    def seed_from(cls, single: Any) -> Any:
+        base = DoubleExponentialInterval.seed_from(single)
+        return extend_params(
+            cls.Params,
+            base,
+            log_bg=getattr(single, "log_bg", single.log_y0 - 4.0),
+        )
+
+
+# --------------------------------------------------------------------------
+# Plain decay models (no interval differencing)
+# --------------------------------------------------------------------------
+class SingleExponentialDecay(CurveModel):
+    r"""Plain exponential decay, with no interval differencing.
+
+    .. math::
+        \hat{y}_j = \eta_j \, y_0 \, e^{-k x_j}
+
+    Unlike the interval models, each observation is the signal *at* a
+    timepoint rather than the amount released between two of them, so no
+    ``t = 0`` edge is prepended and ``x`` is used as given.
+    """
+
+    class Params(eqx.Module):
+        r"""Amplitude :math:`\log y_0` and decay rate :math:`\log k`."""
+
+        log_y0: ArrayLike
+        log_k: ArrayLike
+
+    Consts: ClassVar[type[Any]] = SingleExponentialInterval.Consts
+
+    log_predictions: ClassVar[bool] = True
+
+    def _log_signal(self, p: Any, x: jnp.ndarray) -> jnp.ndarray:
+        r"""Return :math:`\log\left[ y_0 e^{-k x} \right]` at each ``x``."""
+        return cast(jnp.ndarray, p.log_y0 - x * jnp.exp(p.log_k))
+
+    @override
+    def predict(self, p: Any, x: jnp.ndarray, c: Any) -> jnp.ndarray:
+        return cast(jnp.ndarray, c.log_norm + self._log_signal(p, x))
+
+    @override
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        return SingleExponentialDecay.Params(
+            log_y0=jnp.log(jnp.maximum(1.0, y[:, 0])),
+            log_k=jnp.full(y.shape[0], -3.0),
+        )
+
+
+class SingleExponentialDecayWithBackground(SingleExponentialDecay):
+    r""":class:`SingleExponentialDecay` plus a constant background floor.
+
+    .. math::
+        \hat{y}_j = \eta_j \left[ y_0 \, e^{-k x_j} + b \right]
+
+    Here the background *is* identifiable, unlike in the interval models:
+    there is no differencing for it to cancel out of, so every observation
+    constrains it. It is pinned down mainly by the late timepoints, where the
+    decaying term has become small.
+    """
+
+    class Params(SingleExponentialDecay.Params):
+        r""":class:`SingleExponentialDecay.Params` plus a floor
+        :math:`\log b`."""
+
+        log_bg: ArrayLike
+
+    @override
+    def _log_signal(self, p: Any, x: jnp.ndarray) -> jnp.ndarray:
+        return jnp.logaddexp(super()._log_signal(p, x), p.log_bg)
+
+    @override
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        b = super().init(y, x, c)
+        return extend_params(self.Params, b, log_bg=b.log_y0 - 4.0)
+
+
+# --------------------------------------------------------------------------
+# Binding isotherms (linear space)
+# --------------------------------------------------------------------------
+class Langmuir(CurveModel):
+    r"""Langmuir binding isotherm; ``x`` is free ligand concentration.
+
+    .. math::
+        \hat{y}_j = y_{\max} \, \frac{x_j}{x_j + K_d}
+
+    where :math:`K_d = e^{\mathtt{log\_kd}}` and
+    :math:`y_{\max} = e^{\mathtt{log\_ymax}}`. Both are fitted in log space
+    because they span orders of magnitude and must stay positive.
+
+    :math:`y_{\max}` is the natural candidate for ``share=`` or ``fixed=``: it
+    is identified separately from :math:`K_d` only if the titration reaches
+    saturation. See the Sharing parameters guide.
+    """
+
+    class Params(eqx.Module):
+        r"""Dissociation constant :math:`\log K_d` and saturation
+        :math:`\log y_{\max}`."""
+
+        log_kd: ArrayLike
+        log_ymax: ArrayLike
+
+    log_predictions: ClassVar[bool] = False
+
+    @override
+    def predict(self, p: Any, x: jnp.ndarray, c: Any) -> jnp.ndarray:
+        return jnp.exp(p.log_ymax) * x / (x + jnp.exp(p.log_kd))
+
+    @override
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        n = y.shape[0]
+        return Langmuir.Params(
+            log_kd=jnp.full(n, float(jnp.log(jnp.nanmedian(jnp.asarray(x))))),
+            log_ymax=jnp.log(jnp.maximum(jnp.nanmax(y, axis=1), 1e-12)),
+        )
+
+
+class LangmuirWithOffset(Langmuir):
+    r""":class:`Langmuir` with a non-zero baseline.
+
+    .. math::
+        \hat{y}_j = \left( y_{\max} - c \right)
+                     \frac{x_j}{x_j + K_d} + c
+
+    Parameterised so that :math:`c` is the value at :math:`x = 0` and
+    :math:`y_{\max}` remains the asymptote as :math:`x \to \infty`, rather
+    than an amplitude to which the baseline is added. Unlike the other
+    parameters, ``offset`` is fitted directly rather than in log space,
+    because a baseline may legitimately be negative.
+    """
+
+    class Params(Langmuir.Params):
+        r""":class:`Langmuir.Params` plus a linear baseline :math:`c`."""
+
+        offset: ArrayLike
+
+    @override
+    def predict(self, p: Any, x: jnp.ndarray, c: Any) -> jnp.ndarray:
+        ymax = jnp.exp(p.log_ymax)
+        return cast(
+            jnp.ndarray,
+            (ymax - p.offset) * x / (x + jnp.exp(p.log_kd)) + p.offset,
+        )
+
+    @override
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        b = super().init(y, x, c)
+        return extend_params(self.Params, b, offset=jnp.zeros(y.shape[0]))
+
+
+class LogisticAffinity(CurveModel):
+    r"""Langmuir isotherm against **log** concentration.
+
+    .. math::
+        \hat{y}_j = y_{\max} \, \sigma\!\left( x_j - \log K_d \right)
+        = \frac{y_{\max}}{1 + e^{-(x_j - \log K_d)}}
+
+    where :math:`\sigma` is the logistic function and :math:`x_j` is
+    :math:`\log` concentration. Substituting :math:`x_j = \log c_j` recovers
+    :class:`Langmuir` exactly, so this is the same model in a better
+    conditioned coordinate.
+    """
+
+    class Params(eqx.Module):
+        r"""Dissociation constant :math:`\log K_d` and saturation
+        :math:`\log y_{\max}`."""
+
+        log_kd: ArrayLike
+        log_ymax: ArrayLike
+
+    log_predictions: ClassVar[bool] = False
+
+    @override
+    def predict(self, p: Any, x: jnp.ndarray, c: Any) -> jnp.ndarray:
+        return jnp.exp(p.log_ymax) * jax.scipy.special.expit(x - p.log_kd)
+
+    @override
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        n = y.shape[0]
+        return LogisticAffinity.Params(
+            log_kd=jnp.full(n, float(jnp.nanmedian(jnp.asarray(x)))),
+            log_ymax=jnp.log(jnp.maximum(jnp.nanmax(y, axis=1), 1e-12)),
         )

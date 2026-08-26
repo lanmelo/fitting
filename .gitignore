@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Output artifacts written by the example scripts
+koffs.csv.gz
+langmuir_kds.csv.gz

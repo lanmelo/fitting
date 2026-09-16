@@ -32,27 +32,25 @@ Shared values are returned on their own index, with a standard error:
 Vector-valued shared parameters
 -------------------------------
 
-A per-curve parameter is always a scalar, but a shared one may be a **vector**,
-one entry per observation. That is the natural shape for a quantity that is
-common to a group of curves but varies along the observation axis -- a
-per-library sequencing depth, say, rather than a single number per group.
+A per-curve parameter is always a scalar; a shared one may be a **vector**, one
+entry per observation. That suits a quantity common to a group of curves but
+varying along the observation axis, such as a per-library sequencing depth.
 
-The width is read from the starting values, so it never has to be declared:
-give ``init`` a ``(n_curves, width)`` array for that parameter instead of the
-usual ``(n_curves,)``.
+The width is read from the starting values: give ``init`` a
+``(n_curves, width)`` array instead of the usual ``(n_curves,)``.
 
 .. code-block:: python
 
    model = ft.SingleExponentialIntervalFittedDepth(concat_bound=True)
    guess = dataclasses.replace(
-       model.init(y, x, ft.NoConsts()),
+       model.init(y, x, model.Consts()),
        log_eta=seed,                         # (n_curves, width)
    )
    res = ft.fit(counts, x=x, model=model, loss=ft.Poisson(),
                 share={"log_eta": ft.by_level("replicate")}, init=guess)
 
-The fitted values come back on the shared frame with a ``component`` column
-indexing the entries, so one group spans ``width`` rows:
+Fitted values come back on the shared frame with a ``component`` column, so one
+group spans ``width`` rows:
 
 .. code-block:: text
 
@@ -60,11 +58,8 @@ indexing the entries, so one group spans ``width`` rows:
    0   log_eta      0          0  0.586490  0.000006
    1   log_eta      0          1  0.529294  0.000008
 
-They are left out of :attr:`~fitting.results.FitResult.table`, which has one
-row per curve and so no place to put a vector.
-
-A per-curve parameter is always a scalar. Requesting a width for one is an
-error, since there would be no way to interpret it.
+They are left out of :attr:`~fitting.results.FitResult.table`, which has one row
+per curve. Requesting a width for a per-curve parameter is an error.
 
 Why it helps
 ------------
@@ -102,21 +97,34 @@ per-curve amplitudes: adding one on top of :math:`N` free amplitudes
 over-parameterises the model by exactly one degree of freedom, the fit fails to
 converge, and the value drifts.
 
-A vector-valued shared parameter makes this easier to get wrong, because it can
-be collinear with a per-curve parameter *through the model's shape*, not just
-its scale. A free depth vector over :math:`N` observations is an arbitrary
-:math:`N`-point rescaling of the mean curve; if every curve in the group has
-nearly the same shape, that vector and the shape are indistinguishable, and it
-will absorb the shape rather than the depth. What identifies it is **diversity**
-among the curves sharing it: they must differ enough in form that no single
-rescaling can account for all of them. Choose the group's members for that
-diversity, seed from an independent estimate, and compare the fitted vector
-against that estimate afterwards -- a large deviation means the parameter is
+A vector-valued parameter can be collinear with a per-curve one through the
+model's *shape*, not only its scale: a free depth vector is an arbitrary
+:math:`N`-point rescaling of the mean curve, so if every curve in the group has
+nearly the same shape the two are indistinguishable. What identifies it is
+diversity of curve shape within the group. Seed from an independent estimate and
+compare against it afterwards; a large deviation means the parameter is
 absorbing something other than what it names.
 
 The reported standard error is the curvature of the objective with the local
-parameters held at their fitted values. It therefore **ignores coupling with the
-local parameters and is a lower bound**. It will still flag the case that
-matters in practice -- a shared parameter sitting at a genuine but nearly flat
-optimum -- but a small error is not on its own evidence that a shared parameter
-is well determined.
+parameters held fixed, so it **ignores coupling with them and is a lower
+bound**. ``shared_method="profile"`` accounts for that coupling.
+
+Choosing a method
+-----------------
+
+With anything shared, the objective no longer separates and one solver runs over
+all parameters. ``shared_method`` chooses how:
+
+``"joint"`` (default)
+   Optimise every parameter at once with LBFGS. Needs all data and parameters
+   resident, and its step count grows with the number of curves.
+
+``"profile"``
+   Minimise over the shared values alone, solving the curves independently at
+   each step and taking the outer gradient from the envelope theorem. Reaches
+   the same optimum over ``n_shared_total`` dimensions rather than that plus one
+   set per curve, keeps memory bounded by ``chunk_size``, and gives standard
+   errors that account for coupling with the per-curve parameters.
+
+Prefer ``"profile"`` when few values are shared across many curves; it costs one
+inner solve per outer step, so it loses when many values are shared.

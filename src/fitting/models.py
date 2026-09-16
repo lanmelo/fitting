@@ -268,11 +268,9 @@ class SingleExponentialIntervalWithBackground(SingleExponentialInterval):
     def seed_from(cls, previous: Any) -> Any:
         """Seed from a converged fit, with or without a background already.
 
-        A floor starts well below the amplitude, since one comparable to it
-        would already explain the whole trailing observation and leave the rate
-        unconstrained. When ``previous`` carries a floor -- the same model
-        fitted again under different sharing, say -- it is reused rather than
-        reset.
+        A floor starts well below the amplitude; one comparable to it would
+        explain the whole trailing observation and leave the rate
+        unconstrained. An existing floor is reused rather than reset.
         """
         if hasattr(previous, "log_bg"):
             return cls.Params(
@@ -287,62 +285,34 @@ class FittedDepth(eqx.Module):
     r"""Mixin promoting an interval model's depth constant to a parameter.
 
     The depth :math:`\log \eta` moves out of ``Consts`` and into ``Params`` as
-    a shared, vector-valued parameter, so it is estimated from the curves
-    rather than supplied by spike-ins. Predictions are otherwise unchanged:
+    a shared, vector-valued parameter. Predictions are unchanged.
 
-    .. math::
-        \hat{y}_j = \eta_j \left[ B(x_{j-1}) - B(x_j) \right].
+    Like :func:`~fitting.fitting.spikein_log_norm`, the depth is relative to a
+    reference library ``ref``, whose entry is pinned to zero -- so ``log_eta``
+    holds :math:`N - 1` numbers and is directly comparable to a spike-in
+    ``log_norm`` with the same ``ref``. Without that pin, scaling a group's
+    :math:`\eta` and dividing its curves' :math:`y_0` by the same factor
+    changes no prediction, leaving the objective with a flat ridge.
 
-    Like :func:`~fitting.fitting.spikein_log_norm`, the depth is **relative to
-    a reference library** ``ref``, whose entry is pinned to
-    :math:`\log \eta_{\mathrm{ref}} = 0`. So ``log_eta`` holds :math:`N - 1`
-    numbers, not :math:`N`, and the fitted values are directly comparable to a
-    ``log_norm`` built from spike-ins with the same ``ref``.
+    ``log_eta`` must be shared; per curve it is degenerate with the amplitudes
+    and rates. Even pinned, the overall level of the non-reference entries is
+    only weakly determined, since raising them together resembles shifting
+    every rate. Set ``pin_level`` to take that level from
+    ``Consts.log_eta_level`` and fit only the depth's shape.
 
-    The pin is not cosmetic. Without it, scaling a group's :math:`\eta` and
-    dividing every member's :math:`y_0` by the same factor leaves every
-    prediction unchanged, so the objective has an exactly flat ridge and the
-    solve does not converge.
-
-    ``log_eta`` must also be shared: per curve it is degenerate with the
-    amplitudes and rates. Share it over the level the depth varies with -- a
-    replicate, say.
-
-    Even pinned and shared, one further direction is only weakly determined:
-    the *overall level* of the non-reference entries relative to the reference.
-    Raising every :math:`\eta_j` for :math:`j \neq \mathrm{ref}` together is
-    nearly the same as shifting every rate, and only differences in curve
-    *shape* within the group tell the two apart. Two consequences:
-
-    * A group whose curves all have the same shape -- one variant -- constrains
-      it least, so a shape-diverse reference set is preferable.
-    * That level can absorb any systematic failure of the curve model, and it
-      will. If the fitted depth is much wider than an independent estimate,
-      that is what has happened.
-
-    Set ``pin_level`` to take the level from ``Consts.log_eta_level`` instead
-    of fitting it, leaving only the depth's *shape* free. That is usually what
-    you want: the shape is well determined by the curves, the level is not, and
-    an independent estimate of the level already exists in the spike-ins.
-    Pinning it also conditions the solve, since the near-flat direction is
-    removed from the optimisation rather than from its answer.
-
-    Either way, check the result: seed from the spike-ins, compare the fitted
-    vector against that seed, and confirm the depth improves something the fit
-    did not see -- agreement between groups, say. Likelihood cannot judge this,
-    because every curve in a group is tied to that group's depth.
+    Check the result against an independent estimate: a fitted depth much wider
+    than the spike-ins is absorbing model misspecification. Likelihood cannot
+    detect this, since every curve in a group is tied to that group's depth.
 
     Subclasses pair this with a base interval model and add ``log_eta`` to its
     ``Params``.
     """
 
     class LevelConsts(eqx.Module):
-        r"""The overall depth level, used only when ``pin_level`` is set.
+        r"""Mean of :math:`\log \eta` over all observations except ``ref``.
 
-        The mean of :math:`\log \eta` over every observation except ``ref``.
-        Give it the value an independent estimate supplies -- from spike-ins,
-        via :func:`~fitting.fitting.spikein_log_norm` -- since this is the one
-        direction the curves themselves cannot pin down.
+        Used only when ``pin_level`` is set. Supply an independent estimate,
+        since the curves determine this direction least well.
         """
 
         log_eta_level: ArrayLike = 0.0
@@ -367,9 +337,9 @@ class FittedDepth(eqx.Module):
     ) -> jnp.ndarray:
         """Build the per-observation depth from the free parameters.
 
-        Without ``pin_level`` this only re-inserts the reference zero. With it,
-        ``log_eta`` holds :math:`N - 2` deviations, the last deviation is set
-        to make them sum to zero, and ``level`` supplies their mean.
+        Re-inserts the reference zero. With ``pin_level``, ``log_eta`` holds
+        :math:`N - 2` deviations; the last is set to make them sum to zero and
+        ``level`` supplies their mean.
         """
         if not self.pin_level:
             return jnp.insert(log_eta, self.ref % n_points, 0.0)
@@ -393,15 +363,14 @@ class FittedDepth(eqx.Module):
 
     def predict(self, p: Any, x: jnp.ndarray, c: Any) -> jnp.ndarray:
         """Predict one curve, with the depth taken from ``p`` not ``c``."""
-        # The cast is for the type checker only. `base` is `self`, so both
-        # calls still dispatch through the concrete model -- which is what
-        # makes the double-exponential variant use its own _log_bound.
+        # The cast is for the type checker only; `base` is `self`, so both
+        # calls still dispatch through the concrete model.
         # pylint: disable=protected-access
         base = cast(SingleExponentialInterval, self)
         t = jnp.insert(x, 0, 0.0)
-        log_eta = self._full_log_eta(
-            jnp.asarray(p.log_eta), x.shape[0], c.log_eta_level
-        )
+        # the level is only consulted when pinned, so a bare Consts works
+        level = c.log_eta_level if self.pin_level else 0.0
+        log_eta = self._full_log_eta(jnp.asarray(p.log_eta), x.shape[0], level)
         counts = base._to_counts(base._log_bound(p, t))
         return log_eta + counts
 
@@ -525,12 +494,9 @@ class DoubleExponentialIntervalFittedDepth(
 ):
     """:class:`DoubleExponentialInterval` with the depth fitted, not fixed.
 
-    Adding a second population does not on its own make the depth better
-    determined -- on STAMMP-seq data this variant drifted further than the
-    single-exponential one the longer it was run, and did not converge in
-    200000 LBFGS steps. Twice as many per-curve parameters give the weakly
-    determined depth direction more, not less, to trade against. See
-    :class:`FittedDepth`.
+    Twice as many per-curve parameters give the weakly determined depth
+    direction more to trade against, not less, so this converges worse than the
+    single-exponential variant. See :class:`FittedDepth`.
     """
 
     class Params(DoubleExponentialInterval.Params):

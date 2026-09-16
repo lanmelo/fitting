@@ -69,6 +69,9 @@ class FitResult:  # pylint: disable=too-many-instance-attributes
     observed: pd.DataFrame
     #: Weight applied to each observation; 0 marks a masked point.
     mask: pd.DataFrame
+    #: Fit-wide summary: ``n_curves``, ``n_local_per_curve``, ``n_shared``,
+    #: ``loss_total``, ``loss_is_nll``, ``aic_total`` for a likelihood, and
+    #: ``joint_status``/``joint_steps`` when anything was shared.
     info: dict[str, Any] = field(default_factory=dict)
 
     _x: Any = None
@@ -272,6 +275,7 @@ class FitResult:  # pylint: disable=too-many-instance-attributes
             "n_local_per_curve": k_local,
             "n_shared": layout.n_shared_total,
             "loss_is_nll": loss.is_nll,
+            "loss_total": float(losses.sum()),
         }
         if joint_result is not None:
             info["joint_converged"] = joint_result == 0

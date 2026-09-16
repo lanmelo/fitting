@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optimistix as optx
 import pandas as pd
+import scipy.optimize
 
 from .core import (
     FittingError,
@@ -347,6 +348,7 @@ def fit(
     max_steps: int = 10_000,
     joint_solver: Optional[Any] = None,
     joint_max_steps: int = 2_000,
+    shared_method: str = "joint",
     chunk_size: int = 50_000,
     progress: bool = True,
 ) -> FitResult:
@@ -385,7 +387,13 @@ def fit(
             least-squares solver is accepted for modest numbers of curves but
             refused once its dense Jacobian would exceed
             :data:`MAX_JOINT_JACOBIAN_BYTES`.
-        joint_max_steps: step limit for the joint solve.
+        joint_max_steps: step limit for the coupled solve: LBFGS steps for
+            ``shared_method="joint"``, outer iterations for ``"profile"``.
+        shared_method: ``"joint"`` optimises every parameter at once;
+            ``"profile"`` minimises over the shared values alone, solving the
+            curves independently at each step. Both reach the same optimum;
+            ``"profile"`` is cheaper when few values are shared across many
+            curves, and bounds memory by ``chunk_size``.
         chunk_size: curves per ``vmap`` batch for independent curves. Sets peak
             memory.
         progress: print progress and a warning for curves that fail to
@@ -463,10 +471,27 @@ def fit(
         "progress": progress,
     }
     if layout.has_shared:
+        if shared_method == "profile":
+            return _fit_profile(
+                solver=solver,
+                max_steps=max_steps,
+                joint_max_steps=joint_max_steps,
+                **common,
+            )
+        if shared_method != "joint":
+            raise FittingError(
+                f"shared_method must be 'joint' or 'profile', not "
+                f"{shared_method!r}"
+            )
         return _fit_joint(
             joint_solver=joint_solver,
             joint_max_steps=joint_max_steps,
             **common,
+        )
+    if shared_method != "joint":
+        raise FittingError(
+            f"shared_method={shared_method!r} was given but nothing is "
+            f"shared, so there is no coupled solve to choose a method for"
         )
     return _fit_local(
         solver=solver, max_steps=max_steps, chunk_size=chunk_size, **common
@@ -772,14 +797,9 @@ def _per_step(
 ) -> list[Any]:
     """Expand a ``share``/``fixed`` argument to one entry per model.
 
-    A single mapping applies to every step, filtered to the parameters each
-    model actually has -- models in a sequence need not share a parameter list,
-    since a background variant has a ``log_bg`` the plain model does not. A
-    sequence of mappings instead gives each step its own, which is how a
-    parameter is fitted globally and then released::
-
-        ft.fit_stepwise(df, [m, m], x=t,
-                        share=[{"log_bg": None}, None])
+    One mapping applies to every step, filtered to the parameters each model
+    has, since models in a sequence need not share a parameter list. A sequence
+    of mappings gives each step its own.
 
     Args:
         value: one mapping, or one per model, or None.
@@ -790,8 +810,8 @@ def _per_step(
         One mapping (or None) per model.
 
     Raises:
-        FittingError: for a sequence of the wrong length, or a key that names
-            no parameter of the model it is given to.
+        FittingError: for a sequence of the wrong length, or a key naming no
+            parameter of the model it is given to.
     """
     if isinstance(value, Mapping) or value is None:
         if value:
@@ -832,55 +852,206 @@ def _per_step(
     return out
 
 
+def _seed_shared(
+    guess: Any, layout: ParamLayout
+) -> tuple[list[str], list[int], list[int], NDArray]:
+    """Starting values for the shared block, from the per-curve guesses.
+
+    Each group's value is the component-wise median over its members.
+
+    Returns:
+        ``(names, group sizes, widths, flat starting vector)``.
+    """
+    names = list(layout.shared)
+    sizes = [layout.group_sizes[n] for n in names]
+    widths = [layout.width(n) for n in names]
+    blocks = []
+    for name, size, width in zip(names, sizes, widths):
+        per_curve = np.asarray(getattr(guess, name), dtype=float)
+        per_curve = per_curve.reshape(len(per_curve), width)
+        groups = np.asarray(layout.group_index[name])
+        block = np.zeros((size, width))
+        for g in range(size):
+            member = groups == g
+            if member.any():
+                block[g] = np.median(per_curve[member], axis=0)
+        blocks.append(block.ravel())
+    return names, sizes, widths, np.concatenate(blocks)
+
+
+def _fit_profile(
+    *,
+    model: CurveModel,
+    loss: Loss,
+    layout: ParamLayout,
+    guess: Any,
+    curve_loss: Any,
+    x_arr: jnp.ndarray,
+    x_axis: Optional[int],
+    c: Any,
+    c_axes: Any,
+    y_j: jnp.ndarray,
+    w_j: jnp.ndarray,
+    y_np: NDArray,
+    index: pd.Index,
+    columns: pd.Index,
+    solver: Optional[Any],
+    max_steps: int,
+    joint_max_steps: int,
+    progress: bool,
+) -> FitResult:
+    r"""Minimise over the shared parameters, profiling the per-curve ones out.
+
+    The objective separates given the shared values, so for fixed
+    :math:`\theta` each curve is an independent problem and the inner solve is
+    the vectorised path. Minimising
+    :math:`L^*(\theta) = \min_\phi L(\theta, \phi)` reaches the same optimum
+    as the joint solve over ``n_shared_total`` dimensions instead of that plus
+    one set per curve. The outer gradient is
+    :math:`\partial L / \partial \theta` at the inner optimum, by the envelope
+    theorem, so the inner solve is not differentiated through.
+
+    Costs one inner solve per outer step, so it wins when few values are shared
+    across many curves and loses when many are.
+    """
+    if solver is None:
+        solver = optx.BFGS(rtol=1e-9, atol=1e-9)
+    n_curves = len(y_np)
+    names, sizes, widths, shared0 = _seed_shared(guess, layout)
+    theta0 = jnp.stack(
+        [jnp.asarray(getattr(guess, n)).reshape(-1) for n in layout.local],
+        axis=1,
+    )
+    axes = (x_axis, c_axes, 0, 0, {n: 0 for n in names})
+
+    def unflatten(flat: jnp.ndarray) -> dict[str, jnp.ndarray]:
+        """The flat outer vector as one entry per shared parameter."""
+        out: dict[str, jnp.ndarray] = {}
+        offset = 0
+        for name, size, width in zip(names, sizes, widths):
+            block = flat[offset : offset + size * width]
+            out[name] = block if width == 1 else block.reshape(size, width)
+            offset += size * width
+        return out
+
+    def gather(shared: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray]:
+        return {n: shared[n][layout.group_index[n]] for n in names}
+
+    def one(
+        theta: jnp.ndarray, x_i: Any, c_i: Any, y_i: Any, w_i: Any, s_i: Any
+    ) -> Any:
+        sol: Any = optx.minimise(
+            curve_loss,
+            solver,
+            theta,
+            args=(x_i, c_i, y_i, w_i, s_i),
+            max_steps=max_steps,
+            throw=False,
+        )
+        return sol.value, _result_code(sol), sol.stats["num_steps"]
+
+    inner = jax.jit(jax.vmap(one, in_axes=(0, *axes)))
+    per_curve = jax.vmap(curve_loss, in_axes=(0, axes))
+
+    def total(flat: jnp.ndarray, local: jnp.ndarray) -> jnp.ndarray:
+        """Summed loss at a given shared vector and per-curve block."""
+        gathered = gather(unflatten(flat))
+        return jnp.sum(per_curve(local, (x_arr, c, y_j, w_j, gathered)))
+
+    outer_grad = jax.jit(jax.grad(total, argnums=0))
+    state: dict[str, Any] = {"local": theta0, "calls": 0}
+
+    def objective(flat: NDArray) -> tuple[float, NDArray]:
+        """Profile value and its envelope-theorem gradient."""
+        vec = jnp.asarray(flat)
+        local, codes, steps = inner(
+            state["local"], x_arr, c, y_j, w_j, gather(unflatten(vec))
+        )
+        state.update(local=local, codes=codes, steps=steps)
+        state["calls"] += 1
+        value = float(total(vec, local))
+        grad = np.asarray(outer_grad(vec, local), dtype=float)
+        return value, grad
+
+    if progress:
+        print(
+            f"Profile fit: {n_curves} curves, {layout.n_shared_total} shared "
+            f"profiled over {n_curves * layout.n_local} local parameters...",
+            flush=True,
+        )
+    out = scipy.optimize.minimize(
+        objective,
+        np.asarray(shared0, dtype=float),
+        jac=True,
+        method="L-BFGS-B",
+        options={"maxiter": joint_max_steps},
+    )
+    # a final inner solve at the optimum, so the reported curves match it
+    local, codes, steps = inner(
+        state["local"],
+        x_arr,
+        c,
+        y_j,
+        w_j,
+        gather(unflatten(jnp.asarray(out.x))),
+    )
+    code = 0 if out.success else 3
+    return FitResult.build(
+        model=model,
+        loss=loss,
+        layout=layout,
+        index=index,
+        local=np.asarray(local),
+        shared={
+            n: np.asarray(v) for n, v in unflatten(jnp.asarray(out.x)).items()
+        },
+        codes=np.asarray(codes),
+        steps=np.asarray(steps),
+        x=x_arr,
+        x_axis=x_axis,
+        consts=c,
+        c_axes=c_axes,
+        y=y_np,
+        w=np.asarray(w_j),
+        curve_loss=curve_loss,
+        columns=columns,
+        progress=progress,
+        joint_result=code,
+        joint_steps=int(out.nit),
+    )
+
+
 def fit_stepwise(
     data: Any, models: Sequence[CurveModel], x: Any, **kwargs: Any
 ) -> list[FitResult]:
     """Fit each model in turn, seeding it from the previous fit.
 
-    A model with more parameters often needs a good starting point, which a
-    simpler model of the same family can supply. Seeding uses
-    ``models[i].seed_from(previous_params)`` where the model defines it, and
-    otherwise carries over any parameters the two models name identically.
+    Seeding uses ``models[i].seed_from(previous_params)`` where the model
+    defines it, and otherwise carries over identically named parameters.
 
-    ``share`` and ``fixed`` may be given either once, applying to every step,
-    or as one mapping per step. Given once, each model receives only the
-    entries naming a parameter it actually has, so a background parameter can
-    be shared across a sequence beginning with a model that lacks it::
+    ``share`` and ``fixed`` may be one mapping, applied to every step and
+    filtered to the parameters each model has, or one mapping per step::
 
-        single, withbg = ft.fit_stepwise(
-            df, [ft.SingleExponentialInterval(),
-                 ft.SingleExponentialIntervalWithBackground()],
-            x=times, share={"log_bg": None},
-        )
+        # a background shared across curves, absent from the first model
+        ft.fit_stepwise(df, [plain, withbg], x=t, share={"log_bg": None})
 
-    Given per step, each model gets exactly what it is handed -- which is how
-    a parameter is fitted globally and then released to vary per curve, using
-    the pooled estimate as the starting point::
+        # fitted globally, then released to vary per curve
+        ft.fit_stepwise(df, [withbg, withbg], x=t,
+                        share=[{"log_bg": None}, None])
 
-        pooled, released = ft.fit_stepwise(
-            df, [model, model], x=times,
-            share=[{"log_bg": None}, None],
-        )
-
-    Applied once, a key usable by no model at all is an error; applied per
-    step, a key the receiving model lacks is an error. Either way a misspelled
-    name is caught rather than silently dropped.
+    ``shared_method`` is dropped for steps that share nothing.
 
     Args:
         data: one curve per row, as for :func:`fit`.
         models: the models to fit, in order.
         x: the independent variable, as for :func:`fit`.
-        **kwargs: forwarded to :func:`fit`. ``share`` and ``fixed`` are
-            filtered per model as described above; ``init`` may not be given,
-            since seeding is what this function is for.
+        **kwargs: forwarded to :func:`fit`. ``init`` may not be given, since
+            seeding is what this function does.
 
     Returns:
-        One :class:`~fitting.results.FitResult` per model, in the same order,
-        each with its own diagnostics::
+        One :class:`~fitting.results.FitResult` per model, in order::
 
             single, double = ft.fit_stepwise(df, [m1, m2], x=times)
-            both = pd.concat([single.table, double.table],
-                             keys=["single", "double"], axis=1)
 
     Raises:
         FittingError: if ``models`` is empty, if ``init`` is given, or if a
@@ -909,6 +1080,11 @@ def fit_stepwise(
                 if callable(seed)
                 else _carry_over(model, previous)
             )
+        # shared_method describes the coupled solve, so it only applies to a
+        # step that actually shares something -- a sequence normally mixes.
+        step_kwargs = dict(kwargs)
+        if not share[step] and "shared_method" in step_kwargs:
+            del step_kwargs["shared_method"]
         results.append(
             fit(
                 data,
@@ -917,7 +1093,7 @@ def fit_stepwise(
                 init=init,
                 share=share[step],
                 fixed=fixed[step],
-                **kwargs,
+                **step_kwargs,
             )
         )
         previous = results[-1].params()

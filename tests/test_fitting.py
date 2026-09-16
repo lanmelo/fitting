@@ -768,7 +768,7 @@ def test_vector_shared_recovers_depth() -> None:
     model = ft.SingleExponentialIntervalFittedDepth(concat_bound=True)
     seed = true_eta[groups][:, :-1] + rng.normal(0, 0.3, (n, n_points - 1))
     guess = dataclasses.replace(
-        model.init(jnp.asarray(y, float), x, ft.NoConsts()),
+        model.init(jnp.asarray(y, float), x, model.Consts()),
         log_eta=jnp.asarray(seed),
     )
     res = ft.fit(
@@ -814,7 +814,7 @@ def test_double_fitted_depth_shares_the_depth_logic() -> None:
 
     model = ft.DoubleExponentialIntervalFittedDepth(concat_bound=True)
     guess = dataclasses.replace(
-        model.init(jnp.asarray(y, float), x, ft.NoConsts()),
+        model.init(jnp.asarray(y, float), x, model.Consts()),
         log_eta=jnp.asarray(
             np.broadcast_to(true_eta[:-1], (n, n_points - 1))
             + rng.normal(0, 0.2, (n, n_points - 1))
@@ -856,7 +856,7 @@ def test_fitted_depth_ref_is_pinned(cls: Any) -> None:
             for n in model.Params.__dataclass_fields__
         }
     )
-    pred = model.predict(p, x, ft.NoConsts())
+    pred = model.predict(p, x, model.Consts())
     base = cls.__mro__[2](concat_bound=False)
     plain = base.predict(
         p, x, base.Consts(log_norm=jnp.insert(jnp.full(n_free, 3.0), 0, 0.0))
@@ -873,7 +873,7 @@ def test_fitted_depth_requires_sharing() -> None:
         ft.fit(y, x=x, model=model, loss=ft.Poisson(), progress=False)
 
     guess = dataclasses.replace(
-        model.init(jnp.asarray(y), x, ft.NoConsts()), log_eta=jnp.zeros(6)
+        model.init(jnp.asarray(y), x, model.Consts()), log_eta=jnp.zeros(6)
     )
     with pytest.raises(ft.FittingError, match="must be vector valued"):
         ft.fit(

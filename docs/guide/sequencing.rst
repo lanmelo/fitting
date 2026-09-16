@@ -46,9 +46,57 @@ and gathered, so memory is proportional to the number of groups rather than the
 number of curves.
 
 The normalisation enters the model as an additive offset in log space, which is
-why it is a *constant* rather than a parameter. Fitting it instead is possible
-in principle but rarely identifiable: a free overall scale is the same direction
-as the per-curve amplitudes. See :doc:`sharing`.
+why it is a *constant* by default.
+
+Fitting the depth instead
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The spike-ins measure the depth from one construct at one concentration, while
+the samples themselves are thousands of curves spanning every library. Fitting
+the depth from the samples is therefore tempting, and
+:class:`~fitting.SingleExponentialIntervalFittedDepth` does it: the depth
+becomes a shared, vector-valued parameter, relative to the same reference
+library the spike-ins use.
+
+The usual pattern is two stages -- fit the depth on a set of reference curves,
+then hold it constant for the rest -- which keeps the coupled solve small. Two
+things decide whether it is worth doing:
+
+**Pin the reference.** With every entry free, scaling a group's :math:`\eta`
+and dividing its curves' :math:`y_0` by the same factor changes no prediction.
+The objective has an exactly flat ridge and the solve does not converge. The
+model pins the reference entry for this reason; do not work around it.
+
+**Give the solve enough steps.** With tens of thousands of local parameters the
+coupled solve is slow: a fit with 36 shared and 56350 local parameters took
+18469 LBFGS steps. The default ``joint_max_steps`` of 2000 stops well short, and
+a result read off a capped solve is not a result. Check
+``FitResult.info["joint_status"]``.
+
+**Do not judge it by likelihood.** Even pinned, one direction is weakly
+determined: an exponential ramp in :math:`\eta` is nearly indistinguishable from
+a shift in every :math:`k_{\mathrm{off}}`, and only differences in curve shape
+within the group separate them. A group whose curves all have the same shape --
+one variant, say -- constrains it least.
+
+That direction is a nuisance parameter confounded with the quantity of interest,
+and adding it always lowers the objective. Worse, a held-out likelihood check
+does not catch it: the depth is shared across the whole group, so no curve in
+that group is independent of it. On STAMMP-seq data a depth fitted this way
+improved held-out likelihood by 0.16 nats per curve while shifting one
+replicate's median :math:`k_{\mathrm{off}}` twenty-fold, in the opposite
+direction from another's.
+
+**Judge it by an external criterion instead** -- something the fit does not see.
+Agreement between replicates works well: if the depth is real, the same
+variant's :math:`k_{\mathrm{off}}` should agree better across replicates once it
+is applied. In the case above, agreement got **ten times worse** while the
+within-replicate correlations barely moved, which is the signature of a
+per-group scale artefact rather than a depth measurement. Report every quantity
+per group; a pooled median hid a twenty-fold shift in one replicate behind an
+opposite shift in another.
+
+See :doc:`sharing` for the mechanics of vector-valued shared parameters.
 
 Interval counts and the bound library
 -------------------------------------

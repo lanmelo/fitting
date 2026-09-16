@@ -19,7 +19,9 @@ from .losses import SSE, LeastSquares, LogSSE, Loss, Poisson
 from .models import (
     CurveModel,
     DoubleExponentialInterval,
+    DoubleExponentialIntervalFittedDepth,
     DoubleExponentialIntervalWithBackground,
+    FittedDepth,
     Langmuir,
     LangmuirWithOffset,
     LogisticAffinity,
@@ -27,6 +29,7 @@ from .models import (
     SingleExponentialDecay,
     SingleExponentialDecayWithBackground,
     SingleExponentialInterval,
+    SingleExponentialIntervalFittedDepth,
     SingleExponentialIntervalWithBackground,
 )
 from .results import FitResult
@@ -43,6 +46,7 @@ __all__ = [
     "FitResult",
     "Loss",
     "NoConsts",
+    "FittedDepth",
     "FittingError",
     # losses
     "Poisson",
@@ -50,8 +54,10 @@ __all__ = [
     "LogSSE",
     # models
     "SingleExponentialInterval",
+    "SingleExponentialIntervalFittedDepth",
     "SingleExponentialIntervalWithBackground",
     "DoubleExponentialInterval",
+    "DoubleExponentialIntervalFittedDepth",
     "DoubleExponentialIntervalWithBackground",
     "SingleExponentialDecay",
     "SingleExponentialDecayWithBackground",

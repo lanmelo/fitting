@@ -30,6 +30,7 @@ from .core import (
     build_layout,
     field_defaults,
     field_names,
+    infer_widths,
 )
 from .losses import LeastSquares, Loss, Poisson
 from .models import CurveModel, SingleExponentialInterval
@@ -236,7 +237,7 @@ def _prepare_x(
 
 def _init_theta(
     model: CurveModel,
-    layout: ParamLayout,
+    params_cls: type[Any],
     init: Optional[Any],
     y: NDArray,
     x: jnp.ndarray,
@@ -244,7 +245,9 @@ def _init_theta(
 ) -> Any:
     """Per-curve starting values for every parameter, as ``Params``."""
     guess = model.init(jnp.asarray(y), x, consts) if init is None else init
-    missing = [n for n in layout.names if getattr(guess, n, None) is None]
+    missing = [
+        n for n in field_names(params_cls) if getattr(guess, n, None) is None
+    ]
     if missing:
         raise FittingError(f"init is missing values for {missing}")
     return guess
@@ -424,8 +427,20 @@ def fit(
         k: resolve_group_index(v, index, n_curves, k)
         for k, v in (share or {}).items()
     }
-    layout = build_layout(model.Params, n_curves, share_idx, fixed)
-    guess = _init_theta(model, layout, init, y, x_arr, c)
+    # The starting values are needed before the layout, since a shared
+    # parameter's width is read from the shape of its initial value.
+    guess = _init_theta(model, model.Params, init, y, x_arr, c)
+    shared_names = tuple(
+        n for n in field_names(model.Params) if n in share_idx
+    )
+    layout = build_layout(
+        model.Params,
+        n_curves,
+        share_idx,
+        fixed,
+        infer_widths(guess, shared_names, n_curves),
+    )
+    model.check_layout(layout)
 
     curve_loss = _make_curve_loss(model, loss, layout)
     y_j, w_j = jnp.asarray(y), jnp.asarray(w)
@@ -498,7 +513,8 @@ def _fit_local(
         solver = optx.BFGS(rtol=1e-9, atol=1e-9)
     n_curves = len(y_np)
     theta0 = jnp.stack(
-        [jnp.asarray(getattr(guess, n)) for n in layout.local], axis=1
+        [jnp.asarray(getattr(guess, n)).reshape(-1) for n in layout.local],
+        axis=1,
     )
     use_lsq = _check_solver(solver, loss)
     curve_residual: Any = None
@@ -619,25 +635,22 @@ def _fit_joint(
 
     shared_names = layout.shared
     sizes = [layout.group_sizes[n] for n in shared_names]
+    widths = [layout.widths[n] for n in shared_names]
     axes = (x_axis, c_axes, 0, 0, {n: 0 for n in shared_names})
 
-    # Seed each shared value from the median of its group's per-curve guesses.
+    # Seed each shared value from the median of its group's per-curve guesses,
+    # taken component-wise for a vector-valued parameter.
     shared0 = []
-    for name, size in zip(shared_names, sizes):
+    for name, size, width in zip(shared_names, sizes, widths):
         per_curve = np.asarray(getattr(guess, name), dtype=float)
+        per_curve = per_curve.reshape(len(per_curve), width)
         groups = np.asarray(layout.group_index[name])
-        shared0.append(
-            np.array(
-                [
-                    (
-                        np.median(per_curve[groups == g])
-                        if (groups == g).any()
-                        else 0.0
-                    )
-                    for g in range(size)
-                ]
-            )
-        )
+        block = np.zeros((size, width))
+        for g in range(size):
+            member = groups == g
+            if member.any():
+                block[g] = np.median(per_curve[member], axis=0)
+        shared0.append(block.ravel())
     local0 = (
         np.stack(
             [np.asarray(getattr(guess, n), dtype=float) for n in layout.local],
@@ -658,12 +671,15 @@ def _fit_joint(
     ) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
         shared: dict[str, jnp.ndarray] = {}
         offset = 0
-        for name, size in zip(shared_names, sizes):
-            shared[name] = jax.lax.dynamic_slice(theta, (offset,), (size,))
-            offset += size
+        for name, size, width in zip(shared_names, sizes, widths):
+            block = jax.lax.dynamic_slice(theta, (offset,), (size * width,))
+            shared[name] = block if width == 1 else block.reshape(size, width)
+            offset += size * width
         return shared, theta[offset:].reshape(n_curves, layout.n_local)
 
     def gather(shared: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray]:
+        # A scalar parameter gathers to (n_curves,); a vector-valued one to
+        # (n_curves, width), so each curve sees its group's whole vector.
         return {n: shared[n][layout.group_index[n]] for n in shared_names}
 
     per_curve_loss = jax.vmap(curve_loss, in_axes=(0, axes))
@@ -713,7 +729,7 @@ def _fit_joint(
 
     if progress:
         print(
-            f"Joint fit: {n_curves} curves, {int(sum(sizes))} shared + "
+            f"Joint fit: {n_curves} curves, {layout.n_shared_total} shared + "
             f"{n_curves * layout.n_local} local parameters...",
             flush=True,
         )

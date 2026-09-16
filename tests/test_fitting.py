@@ -3,9 +3,11 @@
 # Test-local model containers are small by design.
 # pylint: disable=too-few-public-methods
 
+import dataclasses
 from typing import Any, ClassVar, override
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
 import optimistix as optx
@@ -734,3 +736,152 @@ def test_log_sse_tolerates_masked_non_positive_observations() -> None:
     )
     assert res.diagnostics.converged.all()
     assert np.isfinite(res.local.log_k.to_numpy()).all()
+
+
+def test_vector_shared_recovers_depth() -> None:
+    """A shared, vector-valued depth is recovered from diverse curves."""
+    rng = np.random.default_rng(0)
+    n_per, n_points = 200, 13
+    x = jnp.pad(jnp.arange(2.0, 24.1, 2.0), (0, 1), constant_values=24.0)
+    # Relative to the last library, as spikein_log_norm and the model define it.
+    true_eta = np.stack(
+        [
+            np.log(np.linspace(3.0, 1.0, n_points)),
+            np.log(np.linspace(1.0, 2.5, n_points)) + 0.3,
+        ]
+    )
+    true_eta -= true_eta[:, -1:]
+    groups = np.repeat([0, 1], n_per)
+    n = len(groups)
+
+    plain = ft.SingleExponentialInterval(concat_bound=True)
+    mu = jax.vmap(plain.predict, in_axes=(0, None, 0))(
+        plain.Params(
+            log_y0=jnp.asarray(np.log(rng.uniform(2e5, 2e6, n))),
+            log_k_off=jnp.asarray(np.log(rng.uniform(0.02, 0.4, n))),
+        ),
+        x,
+        plain.Consts(log_norm=jnp.asarray(true_eta[groups])),
+    )
+    y = rng.poisson(np.exp(np.asarray(mu)))
+
+    model = ft.SingleExponentialIntervalFittedDepth(concat_bound=True)
+    seed = true_eta[groups][:, :-1] + rng.normal(0, 0.3, (n, n_points - 1))
+    guess = dataclasses.replace(
+        model.init(jnp.asarray(y, float), x, ft.NoConsts()),
+        log_eta=jnp.asarray(seed),
+    )
+    res = ft.fit(
+        y,
+        x=x,
+        model=model,
+        loss=ft.Poisson(),
+        share={"log_eta": jnp.asarray(groups)},
+        init=guess,
+        progress=False,
+    )
+
+    # No re-anchoring: pinning the reference fixes the gauge, so the fitted
+    # depth is directly comparable to the truth.
+    fitted = model.full_depth(res.shared)
+    assert fitted.shape == (2, n_points)
+    assert np.allclose(fitted[:, -1], 0.0)
+    assert np.max(np.abs(fitted - true_eta)) < 0.02
+
+
+def test_double_fitted_depth_shares_the_depth_logic() -> None:
+    """The double-exponential variant fits the same shared depth vector."""
+    rng = np.random.default_rng(3)
+    n_points = 13
+    x = jnp.pad(jnp.arange(2.0, 24.1, 2.0), (0, 1), constant_values=24.0)
+    true_eta = np.log(np.linspace(2.0, 1.0, n_points))
+    true_eta -= true_eta[-1]
+    n = 400
+
+    plain = ft.DoubleExponentialInterval(concat_bound=True)
+    y0 = np.log(rng.uniform(2e5, 2e6, n))
+    mu = jax.vmap(plain.predict, in_axes=(0, None, None))(
+        plain.Params(
+            log_y0_1=jnp.asarray(y0),
+            log_k_off_1=jnp.asarray(np.log(rng.uniform(0.02, 0.1, n))),
+            log_y0_2=jnp.asarray(y0 - 1.0),
+            log_k_off_2=jnp.asarray(np.log(rng.uniform(0.5, 2.0, n))),
+        ),
+        x,
+        plain.Consts(log_norm=jnp.asarray(true_eta)),
+    )
+    y = rng.poisson(np.exp(np.asarray(mu)))
+
+    model = ft.DoubleExponentialIntervalFittedDepth(concat_bound=True)
+    guess = dataclasses.replace(
+        model.init(jnp.asarray(y, float), x, ft.NoConsts()),
+        log_eta=jnp.asarray(
+            np.broadcast_to(true_eta[:-1], (n, n_points - 1))
+            + rng.normal(0, 0.2, (n, n_points - 1))
+        ),
+    )
+    res = ft.fit(
+        y,
+        x=x,
+        model=model,
+        loss=ft.Poisson(),
+        share={"log_eta": None},
+        init=guess,
+        progress=False,
+    )
+    fitted = model.full_depth(res.shared)
+    assert fitted.shape == (1, n_points)
+    assert fitted[0, -1] == 0.0
+    # The first interval is the least constrained: the fast component releases
+    # most of its amplitude there, so eta_1 trades against log_y0_2.
+    assert np.max(np.abs(fitted[0] - true_eta)) < 0.15
+    assert np.max(np.abs(fitted[0, 1:] - true_eta[1:])) < 0.05
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        ft.SingleExponentialIntervalFittedDepth,
+        ft.DoubleExponentialIntervalFittedDepth,
+    ],
+)
+def test_fitted_depth_ref_is_pinned(cls: Any) -> None:
+    """Whichever library is the reference, its depth entry stays at zero."""
+    x = jnp.arange(1.0, 6.0)
+    model = cls(concat_bound=False, ref=0)
+    n_free = x.shape[0] - 1
+    p = model.Params(
+        **{
+            n: jnp.asarray(0.0 if n != "log_eta" else jnp.full(n_free, 3.0))
+            for n in model.Params.__dataclass_fields__
+        }
+    )
+    pred = model.predict(p, x, ft.NoConsts())
+    base = cls.__mro__[2](concat_bound=False)
+    plain = base.predict(
+        p, x, base.Consts(log_norm=jnp.insert(jnp.full(n_free, 3.0), 0, 0.0))
+    )
+    assert np.allclose(np.asarray(pred), np.asarray(plain))
+
+
+def test_fitted_depth_requires_sharing() -> None:
+    """The fitted-depth model rejects a per-curve or scalar depth."""
+    x = jnp.arange(1.0, 5.0)
+    y = np.full((6, 4), 10.0)
+    model = ft.SingleExponentialIntervalFittedDepth(concat_bound=False)
+    with pytest.raises(ft.FittingError, match="log_eta must be shared"):
+        ft.fit(y, x=x, model=model, loss=ft.Poisson(), progress=False)
+
+    guess = dataclasses.replace(
+        model.init(jnp.asarray(y), x, ft.NoConsts()), log_eta=jnp.zeros(6)
+    )
+    with pytest.raises(ft.FittingError, match="must be vector valued"):
+        ft.fit(
+            y,
+            x=x,
+            model=model,
+            loss=ft.Poisson(),
+            share={"log_eta": jnp.zeros(6, int)},
+            init=guess,
+            progress=False,
+        )

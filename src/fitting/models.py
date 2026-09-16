@@ -13,14 +13,15 @@ magnitude and must stay positive; predictions for the count models are
 likewise formed in log space, so no intermediate quantity is ever
 exponentiated and re-logged."""
 
-from typing import Any, ClassVar, cast, override
+from typing import Any, ClassVar, Optional, cast, override
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pandas as pd
 
-from .core import ArrayLike, NDArray, extend_params
+from .core import ArrayLike, FittingError, NDArray, ParamLayout, extend_params
 
 # Every nested Params/Consts is a pure data container, so pylint's
 # minimum-public-methods rule never applies to them.
@@ -73,6 +74,20 @@ class CurveModel(eqx.Module):
             :attr:`log_predictions`.
         """
         raise NotImplementedError
+
+    def check_layout(self, layout: "ParamLayout") -> None:
+        """Check that this model can be fitted under ``layout``.
+
+        Called once per :func:`~fitting.fitting.fit`, after the layout is
+        resolved. The default accepts everything; a model overrides it when a
+        parameter is only meaningful shared, or only vector valued.
+
+        Args:
+            layout: the resolved parameter layout.
+
+        Raises:
+            FittingError: if the layout is not usable.
+        """
 
     def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
         """Choose starting values for a batch of curves.
@@ -243,6 +258,191 @@ class SingleExponentialIntervalWithBackground(SingleExponentialInterval):
         return extend_params(self.Params, base, log_bg=base.log_y0 - 4.0)
 
 
+class FittedDepth(eqx.Module):
+    r"""Mixin promoting an interval model's depth constant to a parameter.
+
+    The depth :math:`\log \eta` moves out of ``Consts`` and into ``Params`` as
+    a shared, vector-valued parameter, so it is estimated from the curves
+    rather than supplied by spike-ins. Predictions are otherwise unchanged:
+
+    .. math::
+        \hat{y}_j = \eta_j \left[ B(x_{j-1}) - B(x_j) \right].
+
+    Like :func:`~fitting.fitting.spikein_log_norm`, the depth is **relative to
+    a reference library** ``ref``, whose entry is pinned to
+    :math:`\log \eta_{\mathrm{ref}} = 0`. So ``log_eta`` holds :math:`N - 1`
+    numbers, not :math:`N`, and the fitted values are directly comparable to a
+    ``log_norm`` built from spike-ins with the same ``ref``.
+
+    The pin is not cosmetic. Without it, scaling a group's :math:`\eta` and
+    dividing every member's :math:`y_0` by the same factor leaves every
+    prediction unchanged, so the objective has an exactly flat ridge and the
+    solve does not converge.
+
+    ``log_eta`` must also be shared: per curve it is degenerate with the
+    amplitudes and rates. Share it over the level the depth varies with -- a
+    replicate, say.
+
+    Even pinned and shared, one further direction is only weakly determined:
+    the *overall level* of the non-reference entries relative to the reference.
+    Raising every :math:`\eta_j` for :math:`j \neq \mathrm{ref}` together is
+    nearly the same as shifting every rate, and only differences in curve
+    *shape* within the group tell the two apart. Two consequences:
+
+    * A group whose curves all have the same shape -- one variant -- constrains
+      it least, so a shape-diverse reference set is preferable.
+    * That level can absorb any systematic failure of the curve model, and it
+      will. If the fitted depth is much wider than an independent estimate,
+      that is what has happened.
+
+    Set ``pin_level`` to take the level from ``Consts.log_eta_level`` instead
+    of fitting it, leaving only the depth's *shape* free. That is usually what
+    you want: the shape is well determined by the curves, the level is not, and
+    an independent estimate of the level already exists in the spike-ins.
+    Pinning it also conditions the solve, since the near-flat direction is
+    removed from the optimisation rather than from its answer.
+
+    Either way, check the result: seed from the spike-ins, compare the fitted
+    vector against that seed, and confirm the depth improves something the fit
+    did not see -- agreement between groups, say. Likelihood cannot judge this,
+    because every curve in a group is tied to that group's depth.
+
+    Subclasses pair this with a base interval model and add ``log_eta`` to its
+    ``Params``.
+    """
+
+    class LevelConsts(eqx.Module):
+        r"""The overall depth level, used only when ``pin_level`` is set.
+
+        The mean of :math:`\log \eta` over every observation except ``ref``.
+        Give it the value an independent estimate supplies -- from spike-ins,
+        via :func:`~fitting.fitting.spikein_log_norm` -- since this is the one
+        direction the curves themselves cannot pin down.
+        """
+
+        log_eta_level: ArrayLike = 0.0
+
+    Consts: ClassVar[type[Any]] = LevelConsts
+
+    #: Which observation the depth is measured relative to. Its entry is
+    #: pinned to zero and omitted from ``log_eta``.
+    ref: int = eqx.field(static=True, default=-1)
+
+    #: Hold the mean of the non-reference entries at ``log_eta_level`` rather
+    #: than fitting it, so only the depth's shape is free. ``log_eta`` then
+    #: holds :math:`N - 2` numbers instead of :math:`N - 1`.
+    pin_level: bool = eqx.field(static=True, default=False)
+
+    def n_free(self, n_points: int) -> int:
+        """How many numbers ``log_eta`` holds for ``n_points`` observations."""
+        return n_points - (2 if self.pin_level else 1)
+
+    def _full_log_eta(
+        self, log_eta: jnp.ndarray, n_points: int, level: ArrayLike
+    ) -> jnp.ndarray:
+        """Build the per-observation depth from the free parameters.
+
+        Without ``pin_level`` this only re-inserts the reference zero. With it,
+        ``log_eta`` holds :math:`N - 2` deviations, the last deviation is set
+        to make them sum to zero, and ``level`` supplies their mean.
+        """
+        if not self.pin_level:
+            return jnp.insert(log_eta, self.ref % n_points, 0.0)
+        centred = jnp.append(log_eta, -jnp.sum(log_eta))
+        return jnp.insert(level + centred, self.ref % n_points, 0.0)
+
+    def check_layout(self, layout: ParamLayout) -> None:
+        """Require ``log_eta`` to be shared and vector valued."""
+        if "log_eta" not in layout.shared:
+            raise FittingError(
+                "log_eta must be shared: fitted per curve it is degenerate "
+                "with the amplitudes and rates. Pass share={'log_eta': ...} "
+                "to group the curves sequenced at a common depth."
+            )
+        if layout.width("log_eta") == 1:
+            raise FittingError(
+                "log_eta must be vector valued, with one entry per "
+                "observation except the reference. Its starting values should "
+                "have shape (n_curves, n_points - 1)."
+            )
+
+    def predict(self, p: Any, x: jnp.ndarray, c: Any) -> jnp.ndarray:
+        """Predict one curve, with the depth taken from ``p`` not ``c``."""
+        # The cast is for the type checker only. `base` is `self`, so both
+        # calls still dispatch through the concrete model -- which is what
+        # makes the double-exponential variant use its own _log_bound.
+        # pylint: disable=protected-access
+        base = cast(SingleExponentialInterval, self)
+        t = jnp.insert(x, 0, 0.0)
+        log_eta = self._full_log_eta(
+            jnp.asarray(p.log_eta), x.shape[0], c.log_eta_level
+        )
+        counts = base._to_counts(base._log_bound(p, t))
+        return log_eta + counts
+
+    def full_depth(
+        self, shared: pd.DataFrame, level: Optional[ArrayLike] = None
+    ) -> NDArray:
+        r"""Turn fitted ``log_eta`` into a ``log_norm``, one row per group.
+
+        Args:
+            shared: :attr:`~fitting.results.FitResult.shared`, or any frame
+                with ``parameter``, ``group``, ``component`` and ``value``
+                columns.
+            level: the pinned level, one per group in group-index order.
+                Required when ``pin_level`` is set, ignored otherwise.
+
+        Returns:
+            Array of shape ``(n_groups, n_points)``, with the reference entry
+            restored as zero, ready to pass as ``log_norm``. Rows are ordered
+            by group index.
+
+        Raises:
+            FittingError: if ``pin_level`` is set and ``level`` is missing.
+        """
+        block = (
+            shared[shared["parameter"] == "log_eta"]
+            .pivot(index="group", columns="component", values="value")
+            .sort_index()
+            .to_numpy()
+        )
+        if self.pin_level:
+            if level is None:
+                raise FittingError(
+                    "pin_level is set, so full_depth needs level=, the same "
+                    "log_eta_level that was passed as a constant, one value "
+                    "per group"
+                )
+            block = np.concatenate(
+                [block, -block.sum(axis=1, keepdims=True)], axis=1
+            )
+            block = block + np.asarray(level, dtype=float).reshape(-1, 1)
+        return np.insert(block, self.ref % (block.shape[1] + 1), 0.0, axis=1)
+
+
+class SingleExponentialIntervalFittedDepth(
+    FittedDepth, SingleExponentialInterval
+):
+    """:class:`SingleExponentialInterval` with the depth fitted, not fixed.
+
+    See :class:`FittedDepth` for what the depth means and how to check it.
+    """
+
+    class Params(SingleExponentialInterval.Params):
+        r""":class:`SingleExponentialInterval.Params` plus the relative depth
+        :math:`\log \eta`, one entry per observation except ``ref``."""
+
+        log_eta: ArrayLike
+
+    @override
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        return extend_params(
+            SingleExponentialIntervalFittedDepth.Params,
+            SingleExponentialInterval.init(self, y, x, c),
+            log_eta=jnp.zeros((y.shape[0], self.n_free(y.shape[1]))),
+        )
+
+
 class DoubleExponentialInterval(SingleExponentialInterval):
     r"""Two independent dissociating populations, observed as interval counts.
 
@@ -292,6 +492,44 @@ class DoubleExponentialInterval(SingleExponentialInterval):
             log_k_off_1=single.log_k_off,
             log_y0_2=single.log_y0 - 2.0,
             log_k_off_2=jnp.zeros_like(single.log_y0),
+        )
+
+
+class DoubleExponentialIntervalFittedDepth(
+    FittedDepth, DoubleExponentialInterval
+):
+    """:class:`DoubleExponentialInterval` with the depth fitted, not fixed.
+
+    Adding a second population does not on its own make the depth better
+    determined -- on STAMMP-seq data this variant drifted further than the
+    single-exponential one the longer it was run, and did not converge in
+    200000 LBFGS steps. Twice as many per-curve parameters give the weakly
+    determined depth direction more, not less, to trade against. See
+    :class:`FittedDepth`.
+    """
+
+    class Params(DoubleExponentialInterval.Params):
+        r""":class:`DoubleExponentialInterval.Params` plus the relative depth
+        :math:`\log \eta`, one entry per observation except ``ref``."""
+
+        log_eta: ArrayLike
+
+    @override
+    def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
+        return extend_params(
+            DoubleExponentialIntervalFittedDepth.Params,
+            DoubleExponentialInterval.init(self, y, x, c),
+            log_eta=jnp.zeros((y.shape[0], self.n_free(y.shape[1]))),
+        )
+
+    @classmethod
+    @override
+    def seed_from(cls, single: Any) -> Any:
+        """Seed from a converged single-exponential fitted-depth fit."""
+        return extend_params(
+            DoubleExponentialIntervalFittedDepth.Params,
+            DoubleExponentialInterval.seed_from(single),
+            log_eta=single.log_eta,
         )
 
 

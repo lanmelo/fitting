@@ -23,6 +23,7 @@ __all__ = [
     "field_names",
     "field_defaults",
     "extend_params",
+    "infer_widths",
 ]
 
 #: Any float ndarray. Spelled once so strict mypy stays quiet everywhere.
@@ -92,6 +93,13 @@ class ParamLayout(eqx.Module):
     Resolved once, at trace time. ``share`` maps a parameter name to an
     ``(n_curves,)`` integer group index (all zeros for a single global value);
     ``fixed`` maps a name to a scalar or ``(n_curves,)`` array.
+
+    A shared parameter may be **vector valued**, holding ``width`` numbers per
+    group rather than one. Its per-group values are laid out as
+    ``(n_groups, width)`` and a curve receives the whole ``(width,)`` vector.
+    This is what expresses a quantity shared across curves but varying along
+    the observation axis -- a per-library sequencing depth, say. Per-curve
+    parameters are always scalars.
     """
 
     names: tuple[str, ...] = eqx.field(static=True)
@@ -100,6 +108,8 @@ class ParamLayout(eqx.Module):
     fixed_names: tuple[str, ...] = eqx.field(static=True)
     group_index: dict[str, jnp.ndarray]
     group_sizes: dict[str, int] = eqx.field(static=True)
+    #: Numbers held per group, per shared parameter. 1 for a scalar.
+    widths: dict[str, int] = eqx.field(static=True)
     fixed_values: dict[str, jnp.ndarray]
 
     @property
@@ -107,11 +117,24 @@ class ParamLayout(eqx.Module):
         """Number of free per-curve parameters."""
         return len(self.local)
 
+    def width(self, name: str) -> int:
+        """Numbers held per group for a shared ``name``.
+
+        1 for a scalar parameter, otherwise the length of its vector.
+        """
+        # pylint: disable=unsubscriptable-object
+        return self.widths[name]
+
+    def n_shared(self, name: str) -> int:
+        """Number of free values for one shared parameter."""
+        # pylint: disable=unsubscriptable-object
+        return self.group_sizes[name] * self.widths[name]
+
     @property
     def n_shared_total(self) -> int:
         """Total number of shared values across all shared parameters."""
-        # pylint: disable=not-an-iterable,unsubscriptable-object
-        return sum(self.group_sizes[k] for k in self.shared)
+        # pylint: disable=not-an-iterable
+        return sum(self.n_shared(k) for k in self.shared)
 
     @property
     def has_shared(self) -> bool:
@@ -124,8 +147,27 @@ def build_layout(
     n_curves: int,
     share: Optional[Mapping[str, Any]] = None,
     fixed: Optional[Mapping[str, Any]] = None,
+    widths: Optional[Mapping[str, int]] = None,
 ) -> ParamLayout:
-    """Partition ``params_cls`` fields using call-site ``share``/``fixed``."""
+    """Partition ``params_cls`` fields using call-site ``share``/``fixed``.
+
+    Args:
+        params_cls: the model's ``Params`` container.
+        n_curves: number of curves being fitted.
+        share: parameter name to an ``(n_curves,)`` group index, or ``None``
+            for one global value.
+        fixed: parameter name to a pinned value.
+        widths: numbers held per group, for shared parameters that are vector
+            valued. Defaults to 1, a scalar per group.
+
+    Returns:
+        The layout.
+
+    Raises:
+        FittingError: for an unknown parameter name, a parameter both shared
+            and pinned, a mis-shaped group index, a vector-valued *per-curve*
+            parameter, or nothing left to fit.
+    """
     names: tuple[str, ...] = field_names(params_cls)
     share = dict(share or {})
     fixed = dict(fixed or {})
@@ -159,6 +201,16 @@ def build_layout(
         group_index[name] = idx
         group_sizes[name] = int(idx.max()) + 1 if n_curves else 0
 
+    widths = dict(widths or {})
+    bad = {k: v for k, v in widths.items() if k not in share}
+    if bad:
+        raise FittingError(
+            f"widths given for {sorted(bad)}, which are not shared. Only a "
+            f"shared parameter may be vector valued; a per-curve parameter is "
+            f"always a scalar."
+        )
+    resolved_widths = {name: int(widths.get(name, 1)) for name in share}
+
     fixed_values = {
         k: jnp.asarray(v, dtype=jnp.float64) for k, v in fixed.items()
     }
@@ -175,8 +227,51 @@ def build_layout(
         fixed_names=tuple(n for n in names if n in fixed),
         group_index=group_index,
         group_sizes=group_sizes,
+        widths=resolved_widths,
         fixed_values=fixed_values,
     )
+
+
+def infer_widths(
+    guess: Any, shared: tuple[str, ...], n_curves: int
+) -> dict[str, int]:
+    """Read each shared parameter's width from its starting values.
+
+    A scalar parameter starts as ``(n_curves,)``; a vector-valued one as
+    ``(n_curves, width)``. Reading the width from the initial guess keeps it
+    out of the model definition, where it would have to hard-code the number
+    of observations.
+
+    Args:
+        guess: ``Params`` of starting values, one row per curve.
+        shared: names of the shared parameters.
+        n_curves: number of curves, for validation.
+
+    Returns:
+        Parameter name to width, for the shared parameters only.
+
+    Raises:
+        FittingError: if a starting value has an unusable shape.
+    """
+    widths: dict[str, int] = {}
+    for name in shared:
+        value = jnp.asarray(getattr(guess, name))
+        if value.ndim == 1:
+            widths[name] = 1
+        elif value.ndim == 2:
+            widths[name] = int(value.shape[1])
+        else:
+            raise FittingError(
+                f"init['{name}'] has {value.ndim} dimensions; a shared "
+                f"parameter's starting values must be ({n_curves},) for a "
+                f"scalar or ({n_curves}, width) for a vector"
+            )
+        if value.shape[0] != n_curves:
+            raise FittingError(
+                f"init['{name}'] has leading dimension {value.shape[0]}, "
+                f"expected {n_curves}"
+            )
+    return widths
 
 
 def assemble_params(

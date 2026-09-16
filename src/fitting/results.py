@@ -87,9 +87,15 @@ class FitResult:  # pylint: disable=too-many-instance-attributes
         return pd.concat(parts, axis=1)
 
     def _broadcast_shared(self) -> pd.DataFrame:
-        """Repeat each shared value across the curves that share it."""
+        """Repeat each shared value across the curves that share it.
+
+        Vector-valued shared parameters are left out: a vector per curve does
+        not belong in a flat table. Read them from :attr:`shared` instead.
+        """
         out = {}
         for name in self.layout.shared:
+            if self.layout.width(name) > 1:
+                continue
             gi = np.asarray(self.layout.group_index[name])
             vals = self.shared.loc[
                 self.shared["parameter"] == name, "value"
@@ -106,9 +112,12 @@ class FitResult:  # pylint: disable=too-many-instance-attributes
                 values[name] = jnp.asarray(self.local[name].to_numpy())
             elif name in self.layout.shared:
                 gi = np.asarray(self.layout.group_index[name])
+                width = self.layout.width(name)
                 vals = self.shared.loc[
                     self.shared["parameter"] == name, "value"
                 ].to_numpy()
+                if width > 1:
+                    vals = vals.reshape(-1, width)
                 values[name] = jnp.asarray(vals[gi])
             else:
                 values[name] = jnp.broadcast_to(
@@ -261,7 +270,7 @@ class FitResult:  # pylint: disable=too-many-instance-attributes
         info: dict[str, Any] = {
             "n_curves": n_curves,
             "n_local_per_curve": k_local,
-            "n_shared": int(sum(layout.group_sizes[n] for n in layout.shared)),
+            "n_shared": layout.n_shared_total,
             "loss_is_nll": loss.is_nll,
         }
         if joint_result is not None:
@@ -277,11 +286,27 @@ class FitResult:  # pylint: disable=too-many-instance-attributes
 
         n_bad = int((~diag_df["converged"]).sum())
         if n_bad and progress:
-            print(
-                f"warning: {n_bad} / {n_curves} curves did not converge "
-                f"({n_bad / n_curves:.1%}); see FitResult.diagnostics.status",
-                flush=True,
-            )
+            if joint_result is not None:
+                # In the joint path every curve carries the one solve's status,
+                # so a per-curve count would misattribute a single failure.
+                hint = (
+                    " -- raise joint_max_steps"
+                    if info.get("joint_status")
+                    == "nonlinear_max_steps_reached"
+                    else ""
+                )
+                print(
+                    f"warning: the joint solve did not converge "
+                    f"({info['joint_status']}){hint}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"warning: {n_bad} / {n_curves} curves did not converge "
+                    f"({n_bad / n_curves:.1%}); see "
+                    f"FitResult.diagnostics.status",
+                    flush=True,
+                )
 
         return cls(
             model=model,
@@ -368,12 +393,14 @@ def _build_shared_frame(
     which must not be reported as a precise measurement.
     """
     if not shared:
-        return pd.DataFrame(columns=["parameter", "group", "value", "se"])
+        return pd.DataFrame(
+            columns=["parameter", "group", "component", "value", "se"]
+        )
 
     names = list(layout.shared)
     sizes = [layout.group_sizes[nm] for nm in names]
     flat = jnp.asarray(
-        np.concatenate([np.asarray(shared[nm]) for nm in names])
+        np.concatenate([np.asarray(shared[nm]).ravel() for nm in names])
     )
 
     per_curve = jax.vmap(
@@ -384,10 +411,12 @@ def _build_shared_frame(
     def total(theta_shared: jnp.ndarray) -> jnp.ndarray:
         g, off = {}, 0
         for nm, k in zip(names, sizes):
-            g[nm] = jax.lax.dynamic_slice(theta_shared, (off,), (k,))[
-                layout.group_index[nm]
-            ]
-            off += k
+            width = layout.width(nm)
+            block = jax.lax.dynamic_slice(theta_shared, (off,), (k * width,))
+            if width > 1:
+                block = block.reshape(k, width)
+            g[nm] = block[layout.group_index[nm]]
+            off += k * width
         return jnp.sum(
             per_curve(
                 jnp.asarray(local),
@@ -422,16 +451,20 @@ def _build_shared_frame(
     rows = []
     i = 0
     for nm, k in zip(names, sizes):
+        width = layout.width(nm)
+        block = np.asarray(shared[nm]).reshape(k, width)
         for g in range(k):
-            rows.append(
-                {
-                    "parameter": nm,
-                    "group": g,
-                    "value": float(np.asarray(shared[nm])[g]),
-                    "se": float(se[i]),
-                }
-            )
-            i += 1
+            for component in range(width):
+                rows.append(
+                    {
+                        "parameter": nm,
+                        "group": g,
+                        "component": component,
+                        "value": float(block[g, component]),
+                        "se": float(se[i]),
+                    }
+                )
+                i += 1
     out = pd.DataFrame(rows)
     _add_linear_shared(out)
     return out

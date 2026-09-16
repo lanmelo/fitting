@@ -767,6 +767,71 @@ def _fit_joint(
 # ---------------------------------------------------------------------------
 # Sequential fits
 # ---------------------------------------------------------------------------
+def _per_step(
+    value: Any, models: Sequence[CurveModel], label: str
+) -> list[Any]:
+    """Expand a ``share``/``fixed`` argument to one entry per model.
+
+    A single mapping applies to every step, filtered to the parameters each
+    model actually has -- models in a sequence need not share a parameter list,
+    since a background variant has a ``log_bg`` the plain model does not. A
+    sequence of mappings instead gives each step its own, which is how a
+    parameter is fitted globally and then released::
+
+        ft.fit_stepwise(df, [m, m], x=t,
+                        share=[{"log_bg": None}, None])
+
+    Args:
+        value: one mapping, or one per model, or None.
+        models: the models being fitted.
+        label: ``"share"`` or ``"fixed"``, for error messages.
+
+    Returns:
+        One mapping (or None) per model.
+
+    Raises:
+        FittingError: for a sequence of the wrong length, or a key that names
+            no parameter of the model it is given to.
+    """
+    if isinstance(value, Mapping) or value is None:
+        if value:
+            usable = set().union(*(set(field_names(m.Params)) for m in models))
+            unknown = set(value) - usable
+            if unknown:
+                raise FittingError(
+                    f"{label} refers to parameters {sorted(unknown)} which "
+                    f"are not in any of the models given: {sorted(usable)}"
+                )
+        per_model = [value] * len(models)
+        strict = False
+    else:
+        per_model = list(value)
+        if len(per_model) != len(models):
+            raise FittingError(
+                f"{label} has {len(per_model)} entries but there are "
+                f"{len(models)} models; give one mapping to apply to every "
+                f"step, or exactly one per step"
+            )
+        strict = True
+
+    out: list[Any] = []
+    for model, mapping in zip(models, per_model):
+        if not mapping:
+            out.append(mapping)
+            continue
+        names = set(field_names(model.Params))
+        unknown = set(mapping) - names
+        if unknown and strict:
+            # given explicitly for this step, so a mismatch is a mistake
+            raise FittingError(
+                f"{label} for {type(model).__name__} refers to parameters "
+                f"{sorted(unknown)} which are not in "
+                f"{model.Params.__name__}: {sorted(names)}"
+            )
+        out.append({k: v for k, v in mapping.items() if k in names})
+    return out
+
+
 def fit_stepwise(
     data: Any, models: Sequence[CurveModel], x: Any, **kwargs: Any
 ) -> list[FitResult]:
@@ -777,11 +842,37 @@ def fit_stepwise(
     ``models[i].seed_from(previous_params)`` where the model defines it, and
     otherwise carries over any parameters the two models name identically.
 
+    ``share`` and ``fixed`` may be given either once, applying to every step,
+    or as one mapping per step. Given once, each model receives only the
+    entries naming a parameter it actually has, so a background parameter can
+    be shared across a sequence beginning with a model that lacks it::
+
+        single, withbg = ft.fit_stepwise(
+            df, [ft.SingleExponentialInterval(),
+                 ft.SingleExponentialIntervalWithBackground()],
+            x=times, share={"log_bg": None},
+        )
+
+    Given per step, each model gets exactly what it is handed -- which is how
+    a parameter is fitted globally and then released to vary per curve, using
+    the pooled estimate as the starting point::
+
+        pooled, released = ft.fit_stepwise(
+            df, [model, model], x=times,
+            share=[{"log_bg": None}, None],
+        )
+
+    Applied once, a key usable by no model at all is an error; applied per
+    step, a key the receiving model lacks is an error. Either way a misspelled
+    name is caught rather than silently dropped.
+
     Args:
         data: one curve per row, as for :func:`fit`.
         models: the models to fit, in order.
         x: the independent variable, as for :func:`fit`.
-        **kwargs: forwarded to :func:`fit`.
+        **kwargs: forwarded to :func:`fit`. ``share`` and ``fixed`` are
+            filtered per model as described above; ``init`` may not be given,
+            since seeding is what this function is for.
 
     Returns:
         One :class:`~fitting.results.FitResult` per model, in the same order,
@@ -792,14 +883,24 @@ def fit_stepwise(
                              keys=["single", "double"], axis=1)
 
     Raises:
-        FittingError: if ``models`` is empty.
+        FittingError: if ``models`` is empty, if ``init`` is given, or if a
+            ``share``/``fixed`` key names no parameter of any model.
     """
     if not models:
         raise FittingError("models must contain at least one model")
+    if "init" in kwargs:
+        raise FittingError(
+            "fit_stepwise seeds each model from the previous fit, so init= "
+            "would be overwritten. Call fit() directly to choose the starting "
+            "values yourself."
+        )
+
+    share = _per_step(kwargs.pop("share", None), models, "share")
+    fixed = _per_step(kwargs.pop("fixed", None), models, "fixed")
 
     results: list[FitResult] = []
     previous: Optional[Any] = None
-    for model in models:
+    for step, model in enumerate(models):
         init = None
         if previous is not None:
             seed = getattr(model, "seed_from", None)
@@ -808,7 +909,17 @@ def fit_stepwise(
                 if callable(seed)
                 else _carry_over(model, previous)
             )
-        results.append(fit(data, model=model, x=x, init=init, **kwargs))
+        results.append(
+            fit(
+                data,
+                model=model,
+                x=x,
+                init=init,
+                share=share[step],
+                fixed=fixed[step],
+                **kwargs,
+            )
+        )
         previous = results[-1].params()
     return results
 

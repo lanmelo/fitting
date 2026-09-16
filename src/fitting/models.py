@@ -21,7 +21,14 @@ import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 
-from .core import ArrayLike, FittingError, NDArray, ParamLayout, extend_params
+from .core import (
+    ArrayLike,
+    FittingError,
+    NDArray,
+    ParamLayout,
+    extend_params,
+    field_names,
+)
 
 # Every nested Params/Consts is a pure data container, so pylint's
 # minimum-public-methods rule never applies to them.
@@ -256,6 +263,24 @@ class SingleExponentialIntervalWithBackground(SingleExponentialInterval):
     def init(self, y: jnp.ndarray, x: jnp.ndarray, c: Any) -> Any:
         base = super().init(y, x, c)
         return extend_params(self.Params, base, log_bg=base.log_y0 - 4.0)
+
+    @classmethod
+    def seed_from(cls, previous: Any) -> Any:
+        """Seed from a converged fit, with or without a background already.
+
+        A floor starts well below the amplitude, since one comparable to it
+        would already explain the whole trailing observation and leave the rate
+        unconstrained. When ``previous`` carries a floor -- the same model
+        fitted again under different sharing, say -- it is reused rather than
+        reset.
+        """
+        if hasattr(previous, "log_bg"):
+            return cls.Params(
+                **{n: getattr(previous, n) for n in field_names(cls.Params)}
+            )
+        return extend_params(
+            cls.Params, previous, log_bg=previous.log_y0 - 4.0
+        )
 
 
 class FittedDepth(eqx.Module):

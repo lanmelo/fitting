@@ -743,7 +743,7 @@ def test_vector_shared_recovers_depth() -> None:
     rng = np.random.default_rng(0)
     n_per, n_points = 200, 13
     x = jnp.pad(jnp.arange(2.0, 24.1, 2.0), (0, 1), constant_values=24.0)
-    # Relative to the last library, as spikein_log_norm and the model define it.
+    # Relative to the last library, as spikein_log_norm and the model do.
     true_eta = np.stack(
         [
             np.log(np.linspace(3.0, 1.0, n_points)),

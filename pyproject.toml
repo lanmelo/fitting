@@ -146,6 +146,10 @@ variable-rgx = "^[a-z][a-zA-Z0-9_]*$"
 [tool.pylint.format]
 ignore-long-lines = "(?x)(\n\\#\\ type:\\ ignore)"
 max-line-length = 79
+# fitting.py deliberately holds the whole fitting entry point -- the
+# per-curve path, the stepwise driver and the sequencing wrapper -- so a
+# caller reads one module rather than three that only make sense together.
+max-module-lines = 1200
 
 [tool.pylint."messages control"]
 disable = [
